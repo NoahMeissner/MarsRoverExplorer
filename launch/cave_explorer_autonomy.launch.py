@@ -31,9 +31,12 @@ def generate_launch_description():
         package='cave_explorer',
         executable='cave_explorer',
         output='screen',
-        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
-                     'print_feedback': LaunchConfiguration('print_feedback'),
-                    'computer_vision_model_filename': PathJoinSubstitution(config_path+['stop_data.xml'])}]
+        parameters=[
+            PathJoinSubstitution(config_path + ['cave_explorer_params.yaml']),
+            {'use_sim_time': LaunchConfiguration('use_sim_time'),
+             'print_feedback': LaunchConfiguration('print_feedback'),
+             'computer_vision_model_filename': PathJoinSubstitution(config_path + ['stop_data.xml'])},
+        ]
     )
 
     ld.add_action(use_sim_time_launch_arg)

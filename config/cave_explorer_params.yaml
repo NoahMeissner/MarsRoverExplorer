@@ -1,0 +1,65 @@
+# Tunable parameters for the cave explorer planner.
+#
+# With --symlink-install this file is live: edit and relaunch, no rebuild.
+# Values can also be changed at runtime with:
+#   ros2 param set /cave_explorer_node <name> <value>
+#
+# Parameters are declared module by module as each one is implemented.
+# Keys present here but not yet declared in code are simply ignored.
+
+cave_explorer_node:
+  ros__parameters:
+
+    # ---- Navigation wrapper (phase 1) ----
+    nav:
+      goal_timeout_s: 60.0          # give up on a goal after this long
+      max_recoveries: 2             # Nav2's own recovery count before we bail
+      stuck_distance_m: 0.3         # moved less than this...
+      stuck_time_s: 15.0            # ...in this long, while a goal is active
+      path_length_cache_s: 5.0      # reuse compute_path_to_pose results
+
+    # ---- Map model (phase 2) ----
+    map:
+      costmap_blocked_threshold: 50 # costmap value at or above = not navigable
+      min_clearance_m: 1.0          # matches nav2 inflation_radius
+
+    # ---- Frontier exploration (phase 3) ----
+    frontier:
+      min_cluster_cells: 5          # smaller clusters are sensor noise
+      min_clearance_m: 1.0
+      scoring_mode: 'weighted'      # 'nearest' | 'ratio' | 'weighted'
+      w_gain: 1.0                   # cluster size (information)
+      w_path: 1.0                   # real path length (cost)
+      w_turn: 0.5                   # heading change penalty, kills zigzag
+      top_k_path_eval: 5            # candidates given a real path query
+      blacklist_radius_m: 2.0
+      blacklist_max_attempts: 2
+      replan_period_s: 10.0
+      replan_improvement_margin: 0.2  # hysteresis: only switch if clearly better
+
+    # ---- Close-range inspection (phase 4) ----
+    inspection:
+      target_classes: ['TBD_1', 'TBD_2']
+      min_confidence: 0.7
+      min_observations: 3
+      standoff_distances_m: [2.5, 3.5, 4.5]  # tried in order before abandoning
+      n_viewpoint_candidates: 16
+      min_clearance_m: 0.8
+      max_observation_bearing_deg: 90.0      # stay on the side we saw it from
+      align_max_iterations: 8
+      align_pixel_tolerance: 20
+      align_spin_increment_rad: 0.15
+
+    # ---- Behaviour switching (phase 5) ----
+    switching:
+      interrupt_distance_m: 8.0     # closer than this, preempt exploration now;
+                                    # further, queue it for later
+      dedup_radius_m: 2.5           # same class within this = same artefact
+      lost_timeout_s: 10.0          # ONLY applies during ALIGN, never GOTO
+      max_inspection_attempts: 2    # initial try + one retry, then abandoned
+
+    # ---- Metrics (phase 6) ----
+    metrics:
+      enabled: true
+      period_s: 1.0
+      csv_path: '/tmp/cave_explorer_metrics.csv'

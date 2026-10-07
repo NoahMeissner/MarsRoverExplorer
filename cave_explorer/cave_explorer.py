@@ -58,6 +58,18 @@ class CaveExplorer(Node):
     def __init__(self):
         super().__init__('cave_explorer_node')
 
+        # Tunable parameters, overridden by config/cave_explorer_params.yaml.
+        # Declared first, before any blocking call, so they are readable even
+        # while the node is waiting for Nav2 to come up.
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('nav.goal_timeout_s',      60.0),
+                ('nav.max_recoveries',      2),
+                ('nav.stuck_distance_m',    0.3),
+                ('nav.stuck_time_s',        15.0),
+                ('nav.path_length_cache_s', 5.0),
+            ])
         # Variables/Flags for mapping
         self.xlim_ = [0.0, 0.0]
         self.ylim_ = [0.0, 0.0]
@@ -69,6 +81,7 @@ class CaveExplorer(Node):
         self.planner_type_ = PlannerType.ERROR
         self.reached_first_artifact_ = False
         self.returned_home_ = False
+        self.last_feedback_ = None   # latest NavigateToPose feedback, consumed in phase 1
 
         # Marker for artifact locations
         # See https://wiki.ros.org/rviz/DisplayTypes/Marker
@@ -127,6 +140,10 @@ class CaveExplorer(Node):
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
+
+    def p(self, name):
+        """Shorthand for reading a declared parameter."""
+        return self.get_parameter(name).value
     
     def get_pose_2d(self):
         """Get the 2d pose of the robot"""
@@ -154,7 +171,7 @@ class CaveExplorer(Node):
         else: 
             pose.theta = wrap_angle(-2. * math.acos(qw))
 
-        self.get_logger().warn(f'Pose: {pose}')
+        self.get_logger().debug(f'Pose: {pose}')
 
         return pose
 
@@ -277,11 +294,10 @@ class CaveExplorer(Node):
         # Publish visualisation
         self.goal_pose_vis_.publish(action_goal.pose)
 
-        # Decide whether to show feedback or not
-        if self.get_parameter('print_feedback').value:
-            feedback_method = self.feedback_callback
-        else:
-            feedback_method = None
+        # Always register the feedback callback: distance_remaining and
+        # number_of_recoveries drive the timeout and stuck detection.
+        # The launch parameter only controls whether we also log it.
+        feedback_method = self.feedback_callback
 
         # Send goal to action server
         self.get_logger().warn(f'Sending goal [{pose2d.x:.2f}, {pose2d.y:.2f}]...')
@@ -307,8 +323,12 @@ class CaveExplorer(Node):
         """Monitor the feedback from the action server"""
 
         feedback = feedback_msg.feedback
+        self.last_feedback_ = feedback          # consumed by NavClient in phase 1
 
-        self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
+        if self.get_parameter('print_feedback').value:
+            self.get_logger().info(
+                f'{feedback.distance_remaining:.2f} m remaining, '
+                f'{feedback.number_of_recoveries} recoveries')
 
     def goal_reached_callback(self, future):
         """The requested goal has been reached"""
