@@ -3,22 +3,41 @@
 import math
 import random
 from enum import Enum
-
+import torch
+from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
+from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.transforms import functional as TF
 import cv2  # OpenCV2
+import numpy as np  # [P3]
 import rclpy
+import message_filters  # [P3] synchronise RGB + depth image
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point
+from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  # [P3] + PointStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo  # [P3] + CameraInfo
+from std_msgs.msg import ColorRGBA  # [P3]
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+from tf2_geometry_msgs import do_transform_point  # [P3]
+from sklearn.cluster import DBSCAN  # [P3] clustering of repeated observations
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
+
+
+# [P3] Marker colour (r, g, b) per artefact class
+ARTIFACT_COLOURS = {
+    'alien':    (0.0, 1.0, 0.2),
+    'ball':     (0.2, 0.4, 1.0),
+    'graffiti': (1.0, 0.0, 1.0),
+    'mushroom': (1.0, 0.5, 0.0),
+    'stone':    (0.6, 0.4, 0.2),
+    'stop':     (1.0, 0.0, 0.0),
+}
 
 
 def wrap_angle(angle):
@@ -97,6 +116,8 @@ class CaveExplorer(Node):
         # Remember the artifact locations
         # Array of type geometry_msgs.Point
         self.artifact_locations_ = []
+        self.artifact_labels_ = []         # [P3] class name for each entry of artifact_locations_
+        self.artifact_observations_ = {}   # [P3] all observations per class: {label: [np.array([x, y, z]), ...]}
 
         # Initialise CvBridge
         self.cv_bridge_ = CvBridge()
@@ -122,12 +143,33 @@ class CaveExplorer(Node):
         # Prepare image processing
         self.image_detections_pub_ = self.create_publisher(Image, 'detections_image', 1)
         self.declare_parameter('computer_vision_model_filename', rclpy.Parameter.Type.STRING)
-        self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
-        self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
+        self.class_names_ = ['alien', 'ball', 'graffiti', 'mushroom', 'stone', 'stop']  # sorted, label = index + 1
+        model = fasterrcnn_mobilenet_v3_large_fpn(weights=None, weights_backbone=None,
+                                                num_classes=len(self.class_names_) + 1,
+                                                min_size=608, max_size=912)
+        model.rpn.anchor_generator = AnchorGenerator(sizes=((16, 32, 64, 128, 256),) * 3,
+                                                    aspect_ratios=((0.5, 1.0, 2.0),) * 3)
+        model.load_state_dict(torch.load(self.get_parameter('computer_vision_model_filename').value,
+                                        map_location='cpu'))
+        model.eval()
+        self.computer_vision_model_ = model
+
+        # [P3] RGB + depth image are synchronised by timestamp, so the depth always belongs
+        # to the RGB image the detection was made in (the detector takes ~1 s on the CPU)
+        self.image_sub_ = message_filters.Subscriber(self, Image, 'camera/image', qos_profile=1)
+        self.depth_sub_ = message_filters.Subscriber(self, Image, 'camera/depth/image', qos_profile=1)
+        self.image_sync_ = message_filters.ApproximateTimeSynchronizer(
+            [self.image_sub_, self.depth_sub_], queue_size=5, slop=0.1)
+        self.image_sync_.registerCallback(self.image_callback)
+
+        # [P3] Camera intrinsics for artifact localisation (check names with "ros2 topic list")
+        self.camera_info_ = None
+        self.declare_parameter('camera_hfov', 1.047)  # only used if no CameraInfo arrives
+        self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
-    
+
     def get_pose_2d(self):
         """Get the 2d pose of the robot"""
 
@@ -151,7 +193,7 @@ class CaveExplorer(Node):
 
         if qz >= 0.:
             pose.theta = wrap_angle(2. * math.acos(qw))
-        else: 
+        else:
             pose.theta = wrap_angle(-2. * math.acos(qw))
 
         self.get_logger().warn(f'Pose: {pose}')
@@ -162,7 +204,7 @@ class CaveExplorer(Node):
         """New map received, so update x and y limits"""
 
         # Extract data from message
-        map_origin = [map_msg.info.origin.position.x, 
+        map_origin = [map_msg.info.origin.position.x,
                       map_msg.info.origin.position.y]
         map_resolution = map_msg.info.resolution
         map_height = map_msg.info.height
@@ -175,16 +217,20 @@ class CaveExplorer(Node):
         # self.get_logger().warn('Map received:')
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
         # self.get_logger().warn(f'  ylim = [{self.ylim_[0]:.2f}, {self.ylim_[1]:.2f}]')
-    
-    def image_callback(self, image_msg):
+
+    # [P3] Store the camera intrinsics
+    def camera_info_callback(self, info_msg):
+        self.camera_info_ = info_msg
+
+    def image_callback(self, image_msg, depth_msg):  # [P3] + depth_msg (synchronised)
         """
         Recieve an RGB image.
         Use this method to detect artifacts of interest.
-        
-        A simple method has been provided to begin with for detecting stop signs (which is not what we're actually looking for) 
+
+        A simple method has been provided to begin with for detecting stop signs (which is not what we're actually looking for)
         adapted from: https://www.geeksforgeeks.org/detect-an-object-with-opencv-python/
         """
-    
+
         # Copy the image message to a cv image
         # see http://wiki.ros.org/cv_bridge/Tutorials/ConvertingBetweenROSImagesAndOpenCVImagesPython
         image = self.cv_bridge_.imgmsg_to_cv2(image_msg, desired_encoding='passthrough')
@@ -197,7 +243,16 @@ class CaveExplorer(Node):
 
         # Detect artifacts in the image
         # The minSize is used to avoid very small detections that are probably noise
-        detections = stop_sign_model.detectMultiScale(image, minSize=(20,20))
+        with torch.no_grad():
+            out = stop_sign_model([TF.to_tensor(image)])[0]
+        detections = []
+        labels = []
+        for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
+            if score < 0.5:  # CONF from the notebook
+                continue
+            x1, y1, x2, y2 = box.tolist()
+            detections.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+            labels.append(self.class_names_[int(label) - 1])
 
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
         # You may want to communicate more information
@@ -213,7 +268,7 @@ class CaveExplorer(Node):
 
         # Draw a bounding box rectangle on the image for each detection
         for(x, y, width, height) in detections:
-            cv2.rectangle(image, (x, y), (x + height, y + width), (0, 255, 0), 5)
+            cv2.rectangle(image, (x, y), (x + width, y + height), (0, 255, 0), 5)  # [P3] width/height were swapped
 
         # Publish the image with the detection bounding boxes
         image_detection_message = self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8")
@@ -221,34 +276,95 @@ class CaveExplorer(Node):
 
         if self.artifact_found_:
             self.get_logger().info('Artifact found!')
-            self.localise_artifact()
+            # [P3] depth image in metres, taken at the same time as the RGB image
+            depth = self.cv_bridge_.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            depth = depth.astype(np.float32) / (1000.0 if depth_msg.encoding == '16UC1' else 1.0)
+            self.localise_artifact(detections, labels, image_msg.header, image.shape, depth)  # [P3] pass detections
 
 
-    def localise_artifact(self):
+    def localise_artifact(self, detections, labels, header, image_shape, depth):
         """
-        INCOMPLETE:
-        Compute the location of the artifact
+        [P3] Compute the location of each detected artifact:
+          - direction from the pixel coordinates of the bounding box centre (pinhole model)
+          - distance from the depth camera (median depth in the centre of the box)
+          - transform into the map frame with TF
+          - all observations are clustered per class with DBSCAN (scikit-learn);
+            each cluster = one artifact, its position = median of the cluster,
+            observations that belong to no cluster are treated as false positives
         Save it to a list, publish rviz marker
-        This version just uses the robot location rather than the artifact location
-        You can find other examples of using RViz markers in the previous assignments template code
         """
 
-        # Current location of the robot
-        robot_pose = self.get_pose_2d()
+        img_h, img_w = image_shape[:2]
+        sx, sy = depth.shape[1] / img_w, depth.shape[0] / img_h  # in case depth has another resolution
 
-        if robot_pose == None:
-            self.get_logger().warn(f'localise_artifact: robot_pose is None.')
-            return
+        # Camera intrinsics (CameraInfo, otherwise from the horizontal field of view)
+        if self.camera_info_ is not None:
+            k = self.camera_info_.k
+            fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+        else:
+            fx = fy = img_w / (2.0 * math.tan(self.get_parameter('camera_hfov').value / 2.0))
+            cx, cy = img_w / 2.0, img_h / 2.0
 
-        # Compute the location of the artifact
-        # This is currently INCOMPLETE
-        point = Point()
-        point.x = robot_pose.x
-        point.y = robot_pose.y
-        point.z = 1.0
+        # Camera frame from the image header, base_link if it is not in the TF tree
+        frame = header.frame_id
+        if not frame or not self.tf_buffer.can_transform('map', frame, rclpy.time.Time()):
+            frame = 'base_link'
+        try:
+            # Robot pose at the time the image was taken, not "now" (robot keeps moving during detection)
+            t = self.tf_buffer.lookup_transform('map', frame, rclpy.time.Time.from_msg(header.stamp))
+        except TransformException:
+            try:
+                # Fallback: latest available transform
+                t = self.tf_buffer.lookup_transform('map', frame, rclpy.time.Time())
+                self.get_logger().warn('localise_artifact: TF at image time not available, using latest',
+                                       throttle_duration_sec=5.0)
+            except TransformException as ex:
+                self.get_logger().warn(f'localise_artifact: {ex}')
+                return
 
-        # Save it
-        self.artifact_locations_.append(point)
+        for (x, y, w, h), label in zip(detections, labels):
+            # Distance: median of the valid depth values in the central third of the box
+            patch = depth[int((y + h / 3) * sy):int((y + 2 * h / 3) * sy) + 1,
+                          int((x + w / 3) * sx):int((x + 2 * w / 3) * sx) + 1]
+            valid = patch[np.isfinite(patch) & (patch > 0.3) & (patch < 8.0)]
+            if valid.size < 5:
+                self.get_logger().warn(f'{label}: no valid depth in box (patch {patch.shape}, '
+                                       f'depth range {np.nanmin(depth):.2f}-{np.nanmax(depth):.2f})')
+                continue
+            d = float(np.median(valid))
+
+            # Direction: offset of the box centre from the image centre
+            right = (x + w / 2.0 - cx) * d / fx
+            down = (y + h / 2.0 - cy) * d / fy
+
+            p = PointStamped()
+            p.header.frame_id = frame
+            if 'optical' in frame:   # optical frame: z forward, x right, y down
+                p.point.x, p.point.y, p.point.z = right, down, d
+            else:                    # body frame: x forward, y left, z up
+                p.point.x, p.point.y, p.point.z = d, -right, -down
+            p_map = do_transform_point(p, t).point
+            pos = np.array([p_map.x, p_map.y, p_map.z])
+            self.get_logger().info(f'{label}: depth={d:.2f} m, angle={math.degrees(math.atan2(-right, d)):+.0f} deg '
+                                   f'-> map ({pos[0]:.2f}, {pos[1]:.2f})')
+
+            # Store the observation, clustering is done below
+            self.artifact_observations_.setdefault(label, []).append(pos)
+
+        # Cluster all observations of each class with DBSCAN (in the ground plane x, y):
+        #   eps = 1.5 m: observations closer than this are neighbours (same artifact)
+        #   min_samples = 3: a cluster needs at least 3 observations, the rest is noise (false positives)
+        self.artifact_locations_ = []
+        self.artifact_labels_ = []
+        for label, points in self.artifact_observations_.items():
+            points = np.array(points)
+            if len(points) < 3:
+                continue
+            cluster_ids = DBSCAN(eps=1.5, min_samples=3).fit_predict(points[:, :2])
+            for cid in set(cluster_ids) - {-1}:     # -1 = noise
+                m = np.median(points[cluster_ids == cid], axis=0)
+                self.artifact_locations_.append(Point(x=float(m[0]), y=float(m[1]), z=float(m[2])))
+                self.artifact_labels_.append(label)
 
         # Publish the markers
         self.publish_artifact_markers()
@@ -258,10 +374,35 @@ class CaveExplorer(Node):
 
         # Update the locations
         self.marker_artifacts_.points = self.artifact_locations_
+        # [P3] one colour per class
+        self.marker_artifacts_.colors = [ColorRGBA(r=c[0], g=c[1], b=c[2], a=1.0)
+                                         for c in (ARTIFACT_COLOURS.get(l, (1.0, 1.0, 0.0))
+                                                   for l in self.artifact_labels_)]
 
         # Create and publish the MarkerArray
         marker_array = MarkerArray()
-        marker_array.markers = [self.marker_artifacts_]
+        # [P3] remove old text labels first (number of clusters can shrink when clusters merge)
+        clear = Marker()
+        clear.header.frame_id = "map"
+        clear.ns = "artifact_labels"
+        clear.action = Marker.DELETEALL
+        marker_array.markers = [clear, self.marker_artifacts_]
+
+        # [P3] text label above each artifact
+        for i, (point, label) in enumerate(zip(self.artifact_locations_, self.artifact_labels_)):
+            text = Marker()
+            text.header.frame_id = "map"
+            text.ns = "artifact_labels"
+            text.id = i
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position = Point(x=point.x, y=point.y, z=point.z + 1.5)
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.8
+            text.color.r = text.color.g = text.color.b = text.color.a = 1.0
+            text.text = label
+            marker_array.markers.append(text)
+
         self.marker_pub_.publish(marker_array)
 
 
@@ -401,7 +542,7 @@ class CaveExplorer(Node):
         Set the next goal pose and send to the action server
         See https://docs.nav2.org/concepts/index.html
         """
-        
+
         # Don't do anything until SLAM is launched
         if not self.tf_buffer.can_transform(
                 'map',

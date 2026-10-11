@@ -33,7 +33,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
                      'print_feedback': LaunchConfiguration('print_feedback'),
-                    'computer_vision_model_filename': PathJoinSubstitution(config_path+['stop_data.xml'])}]
+                    'computer_vision_model_filename': PathJoinSubstitution(config_path+['best.pt'])}]
     )
 
     ld.add_action(use_sim_time_launch_arg)
