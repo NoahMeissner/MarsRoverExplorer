@@ -124,7 +124,13 @@ class CaveExplorer(Node):
 
         # Prepare transformation to get robot pose
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # [P3] TF is received by a small helper node in its own thread, so the buffer stays
+        # up to date while the detector blocks the image callback (~1 s).
+        # (spin_thread=True on the main node would also spin the action client -> crash)
+        self.tf_node_ = rclpy.create_node(
+            'cave_explorer_tf_listener',
+            parameter_overrides=[rclpy.Parameter('use_sim_time', value=True)])
+        self.tf_listener = TransformListener(self.tf_buffer, self.tf_node_, spin_thread=True)
 
         # Action client for nav2
         self.nav2_action_client_ = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -138,6 +144,7 @@ class CaveExplorer(Node):
         self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose', 1)
 
         # Subscribe to the map topic to get current bounds
+        self.map_grid_ = None   # [P3] latest SLAM map as numpy array (see map_callback)
         self.map_sub_ = self.create_subscription(OccupancyGrid, 'map',  self.map_callback, 1)
 
         # Prepare image processing
@@ -152,6 +159,9 @@ class CaveExplorer(Node):
         model.load_state_dict(torch.load(self.get_parameter('computer_vision_model_filename').value,
                                         map_location='cpu'))
         model.eval()
+        # [P3] PyTorch uses all CPU cores by default and then starves Gazebo, SLAM and the
+        # odometry (TF lags by seconds) -> limit the detector to 2 threads
+        torch.set_num_threads(2)
         self.computer_vision_model_ = model
 
         # [P3] RGB + depth image are synchronised by timestamp, so the depth always belongs
@@ -164,7 +174,7 @@ class CaveExplorer(Node):
 
         # [P3] Camera intrinsics for artifact localisation (check names with "ros2 topic list")
         self.camera_info_ = None
-        self.declare_parameter('camera_hfov', 1.047)  # only used if no CameraInfo arrives
+        self.declare_parameter('camera_hfov', 2.0944)  # 120 deg, <horizontal_fov> in urdf/mars_explorer.gazebo.xacro (used if no CameraInfo arrives)
         self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
 
         # Timer for main loop
@@ -213,6 +223,10 @@ class CaveExplorer(Node):
         # Set current limits
         self.xlim_ = [map_origin[0], map_origin[0]+map_width*map_resolution]
         self.ylim_ = [map_origin[1], map_origin[1]+map_height*map_resolution]
+
+        # [P3] keep the map to check artifact estimates against walls / unknown space
+        self.map_info_ = map_msg.info
+        self.map_grid_ = np.array(map_msg.data, dtype=np.int8).reshape(map_height, map_width)
 
         # self.get_logger().warn('Map received:')
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
@@ -286,8 +300,9 @@ class CaveExplorer(Node):
         """
         [P3] Compute the location of each detected artifact:
           - direction from the pixel coordinates of the bounding box centre (pinhole model)
-          - distance from the depth camera (median depth in the centre of the box)
-          - transform into the map frame with TF
+          - distance from the depth camera (25 % quantile of the depth in the centre of the box)
+          - transform into the map frame with TF (robot pose at the time the image was taken)
+          - check against the SLAM map (not behind a wall, not in unknown space)
           - all observations are clustered per class with DBSCAN (scikit-learn);
             each cluster = one artifact, its position = median of the cluster,
             observations that belong to no cluster are treated as false positives
@@ -301,51 +316,77 @@ class CaveExplorer(Node):
         if self.camera_info_ is not None:
             k = self.camera_info_.k
             fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+            self.get_logger().info(f'Intrinsics from CameraInfo: fx={fx:.1f} cx={cx:.1f}', once=True)
         else:
             fx = fy = img_w / (2.0 * math.tan(self.get_parameter('camera_hfov').value / 2.0))
             cx, cy = img_w / 2.0, img_h / 2.0
+            self.get_logger().warn('No CameraInfo received -> intrinsics guessed from camera_hfov', once=True)
 
         # Camera frame from the image header, base_link if it is not in the TF tree
         frame = header.frame_id
         if not frame or not self.tf_buffer.can_transform('map', frame, rclpy.time.Time()):
             frame = 'base_link'
+        # TF in two steps, because SLAM (map -> odom) lags behind by seconds while the detector
+        # keeps the CPU busy, but odometry (odom -> base_link) is published fast:
+        #   odom -> camera at the time the image was taken (precise robot motion)
+        #   map  -> odom latest (SLAM correction, changes only slowly)
+        odom = 'odom'
         try:
-            # Robot pose at the time the image was taken, not "now" (robot keeps moving during detection)
-            t = self.tf_buffer.lookup_transform('map', frame, rclpy.time.Time.from_msg(header.stamp))
+            t_odom = self.tf_buffer.lookup_transform(odom, frame, rclpy.time.Time.from_msg(header.stamp))
         except TransformException:
             try:
-                # Fallback: latest available transform
-                t = self.tf_buffer.lookup_transform('map', frame, rclpy.time.Time())
-                self.get_logger().warn('localise_artifact: TF at image time not available, using latest',
-                                       throttle_duration_sec=5.0)
+                # latest odometry is only OK if it is close in time to the image
+                t_odom = self.tf_buffer.lookup_transform(odom, frame, rclpy.time.Time())
+                img_t = header.stamp.sec + header.stamp.nanosec * 1e-9
+                tf_t = t_odom.header.stamp.sec + t_odom.header.stamp.nanosec * 1e-9
+                if abs(img_t - tf_t) > 0.2:
+                    self.get_logger().warn(f'localise_artifact: no odometry close to image time '
+                                           f'(dt={img_t - tf_t:.2f} s) -> skipped', throttle_duration_sec=5.0)
+                    return
             except TransformException as ex:
-                self.get_logger().warn(f'localise_artifact: {ex}')
+                self.get_logger().warn(f'localise_artifact: {ex}', throttle_duration_sec=5.0)
                 return
+        try:
+            t_map = self.tf_buffer.lookup_transform('map', odom, rclpy.time.Time())
+        except TransformException as ex:
+            self.get_logger().warn(f'localise_artifact: {ex}', throttle_duration_sec=5.0)
+            return
+
+        def to_map(point_stamped):
+            return do_transform_point(do_transform_point(point_stamped, t_odom), t_map).point
+
+        # camera position in the map (start of the viewing ray for the map check)
+        origin = PointStamped()
+        origin.header.frame_id = frame
+        cam_map = to_map(origin)
+        cam = np.array([cam_map.x, cam_map.y])
 
         for (x, y, w, h), label in zip(detections, labels):
-            # Distance: median of the valid depth values in the central third of the box
+            u, v = x + w / 2.0, y + h / 2.0   # box centre in pixels
+
+            # Distance: depth values in the central third of the box
             patch = depth[int((y + h / 3) * sy):int((y + 2 * h / 3) * sy) + 1,
                           int((x + w / 3) * sx):int((x + 2 * w / 3) * sx) + 1]
             valid = patch[np.isfinite(patch) & (patch > 0.3) & (patch < 8.0)]
             if valid.size < 5:
-                self.get_logger().warn(f'{label}: no valid depth in box (patch {patch.shape}, '
-                                       f'depth range {np.nanmin(depth):.2f}-{np.nanmax(depth):.2f})')
+                self.get_logger().info(f'{label}: out of depth range, skipped', throttle_duration_sec=5.0)
                 continue
-            d = float(np.median(valid))
+            # 25 % quantile instead of median: the object is in front of its background,
+            # so background pixels inside the box must not make the distance too long
+            d = float(np.percentile(valid, 25))
 
-            # Direction: offset of the box centre from the image centre
-            right = (x + w / 2.0 - cx) * d / fx
-            down = (y + h / 2.0 - cy) * d / fy
-
-            p = PointStamped()
-            p.header.frame_id = frame
-            if 'optical' in frame:   # optical frame: z forward, x right, y down
-                p.point.x, p.point.y, p.point.z = right, down, d
-            else:                    # body frame: x forward, y left, z up
-                p.point.x, p.point.y, p.point.z = d, -right, -down
-            p_map = do_transform_point(p, t).point
+            # Direction: offset of the box centre from the image centre (pinhole model)
+            p_map = to_map(self.camera_point(frame, (u - cx) * d / fx, (v - cy) * d / fy, d))
             pos = np.array([p_map.x, p_map.y, p_map.z])
-            self.get_logger().info(f'{label}: depth={d:.2f} m, angle={math.degrees(math.atan2(-right, d)):+.0f} deg '
+
+            # Sanity check against the SLAM map: an artifact cannot be behind a wall
+            pos = self.check_against_map(cam, pos)
+            if pos is None:
+                self.get_logger().info(f'{label}: estimate in unknown space / outside map -> rejected')
+                continue
+
+            angle = math.degrees(math.atan2(-(u - cx), fx))
+            self.get_logger().info(f'{label}: depth={d:.2f} m, angle={angle:+.0f} deg '
                                    f'-> map ({pos[0]:.2f}, {pos[1]:.2f})')
 
             # Store the observation, clustering is done below
@@ -368,6 +409,45 @@ class CaveExplorer(Node):
 
         # Publish the markers
         self.publish_artifact_markers()
+
+    def camera_point(self, frame, right, down, forward):
+        """[P3] Point in the camera frame (optical or ROS body convention)"""
+        p = PointStamped()
+        p.header.frame_id = frame
+        if 'optical' in frame:   # optical frame: z forward, x right, y down
+            p.point.x, p.point.y, p.point.z = right, down, forward
+        else:                    # body frame: x forward, y left, z up
+            p.point.x, p.point.y, p.point.z = forward, -right, -down
+        return p
+
+    def check_against_map(self, cam, pos):
+        """
+        [P3] Walk along the viewing ray from the camera to the estimate through the SLAM map.
+          - ray hits a wall first -> the depth was too long (e.g. looked past the object),
+            the estimate is moved onto the wall (slightly in front of it)
+          - estimate lies in unknown space or outside the map -> rejected (None)
+        """
+        if self.map_grid_ is None:
+            return pos
+        info = self.map_info_
+        res, ox, oy = info.resolution, info.origin.position.x, info.origin.position.y
+        h, w = self.map_grid_.shape
+        ray = pos[:2] - cam
+        dist = np.linalg.norm(ray)
+        if dist < 1e-3:
+            return pos
+        n = int(dist / res) + 1
+        for i in range(1, n + 1):
+            p = cam + ray * i / n
+            c, r = int((p[0] - ox) / res), int((p[1] - oy) / res)
+            if not (0 <= r < h and 0 <= c < w):
+                return None
+            if self.map_grid_[r, c] >= 65:          # occupied cell -> wall
+                p = p - 0.15 * ray / dist           # 15 cm in front of the wall
+                return np.array([p[0], p[1], pos[2]])
+        if self.map_grid_[r, c] < 0:                # unknown cell
+            return None
+        return pos
 
     def publish_artifact_markers(self):
         """ Publish the artifact location markers"""
