@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import math
+import os
 import random
+import time
 from enum import Enum
 import torch
 from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
@@ -12,6 +14,7 @@ import numpy as np  # [P3]
 import rclpy
 import message_filters  # [P3] synchronise RGB + depth image
 from cv_bridge import CvBridge
+from action_msgs.msg import GoalStatus  # [P1]
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  # [P3] + PointStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
@@ -27,6 +30,8 @@ from sklearn.cluster import DBSCAN  # [P3] clustering of repeated observations
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
+
+from cave_explorer.frontier_exploration import FrontierExplorer  # [P1]
 
 
 # [P3] Marker colour (r, g, b) per artefact class
@@ -70,6 +75,8 @@ class PlannerType(Enum):
     GO_TO_FIRST_ARTIFACT = 3
     RANDOM_WALK = 4
     RANDOM_GOAL = 5
+    EXPLORE_FRONTIERS = 6   # [P1] frontier-based exploration
+    EXPLORATION_DONE = 7    # [P1] no frontier left, returned home
     # Add more!
 
 
@@ -177,6 +184,41 @@ class CaveExplorer(Node):
         self.declare_parameter('camera_hfov', 2.0944)  # 120 deg, <horizontal_fov> in urdf/mars_explorer.gazebo.xacro (used if no CameraInfo arrives)
         self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
 
+        # [P1] Frontier-based exploration (see frontier_exploration.py)
+        p = lambda name, default: self.declare_parameter('exploration.' + name, default).value
+        self.explorer_ = FrontierExplorer(
+            min_clearance=p('min_clearance', 0.6),          # [m] robot_radius in nav2_params.yaml is 0.5
+            min_frontier_size=p('min_frontier_size', 4),    # [cells] = 1.2 m at the 0.3 m SLAM resolution
+            viewpoint_radius=p('viewpoint_radius', 1.5),
+            min_goal_dist=p('min_goal_dist', 1.0),          # = xy_goal_tolerance of Nav2
+            w_size=p('w_size', 1.0),
+            w_dist=p('w_dist', 1.0),
+            w_turn=p('w_turn', 1.0),
+            target_bonus=p('target_bonus', 3.0))
+        self.replan_period_ = p('replan_period', 2.0)       # [s] re-evaluate frontiers while driving
+        self.visited_radius_ = p('visited_radius', 1.5)     # [m] reached goals are not selected again
+        self.failed_radius_ = p('failed_radius', 2.0)       # [m] goals Nav2 failed on are not selected again
+        self.max_attempts_ = p('max_attempts', 2)           # Nav2 failures before a goal is given up
+        self.stuck_time_ = p('stuck_time', 20.0)            # [s] no progress for this long -> give up goal
+        self.log_dir_ = os.path.expanduser(p('log_dir', '~/cave_explorer_logs'))
+        planner = self.declare_parameter('planner', 'explore').value   # 'explore' or 'template'
+        if planner == 'explore':
+            self.planner_type_ = PlannerType.EXPLORE_FRONTIERS
+
+        self.goal_seq_ = 0               # id of the latest Nav2 goal, older results are ignored
+        self.goal_sent_time_ = 0.0
+        self.goal_timeout_ = 0.0
+        self.explore_target_ = None      # np.array([x, y]) of the frontier viewpoint being driven to
+        self.visited_goals_ = []         # [(x, y)] reached viewpoints
+        self.failed_goals_ = []          # [[x, y, n_failures]] viewpoints Nav2 could not reach / timed out
+        self.last_replan_ = -math.inf
+        self.progress_pose_ = None       # (x, y, t) last time the robot made progress
+        self.explore_start_ = None
+        self.last_pose_ = None
+        self.distance_travelled_ = 0.0
+        self.exploration_log_ = None
+        self.exploration_marker_pub_ = self.create_publisher(MarkerArray, 'exploration_markers', 10)
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
 
@@ -205,8 +247,6 @@ class CaveExplorer(Node):
             pose.theta = wrap_angle(2. * math.acos(qw))
         else:
             pose.theta = wrap_angle(-2. * math.acos(qw))
-
-        self.get_logger().warn(f'Pose: {pose}')
 
         return pose
 
@@ -504,25 +544,35 @@ class CaveExplorer(Node):
         else:
             feedback_method = None
 
+        # [P1] Sending a new goal while one is running preempts it in Nav2 (no stop in between).
+        # Every goal gets an id, so the result of a preempted goal is ignored.
+        self.goal_seq_ += 1
+        seq = self.goal_seq_
+        self.ready_for_next_goal_ = False
+        self.goal_sent_time_ = self.now_s()
+
         # Send goal to action server
         self.get_logger().warn(f'Sending goal [{pose2d.x:.2f}, {pose2d.y:.2f}]...')
         self.send_goal_future_ = self.nav2_action_client_.send_goal_async(
             action_goal,
             feedback_callback=feedback_method)
-        self.send_goal_future_.add_done_callback(self.goal_response_callback)
+        self.send_goal_future_.add_done_callback(lambda f: self.goal_response_callback(f, seq))
 
-    def goal_response_callback(self, future):
+    def goal_response_callback(self, future, seq):
         """The requested goal pose has been sent to the action server"""
 
+        if seq != self.goal_seq_:   # [P1] already replaced by a newer goal
+            return
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error('Goal rejected')
+            self.goal_finished(GoalStatus.STATUS_ABORTED)   # [P1] template got stuck here forever
             return
 
         # Goal accepted: get result when it's completed
         self.get_logger().warn(f'Goal accepted')
         self.get_result_future_ = goal_handle.get_result_async()
-        self.get_result_future_.add_done_callback(self.goal_reached_callback)
+        self.get_result_future_.add_done_callback(lambda f: self.goal_reached_callback(f, seq))
 
     def feedback_callback(self, feedback_msg):
         """Monitor the feedback from the action server"""
@@ -531,11 +581,25 @@ class CaveExplorer(Node):
 
         self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
 
-    def goal_reached_callback(self, future):
+    def goal_reached_callback(self, future, seq):
         """The requested goal has been reached"""
 
-        result = future.result().result
-        self.get_logger().info(f'Goal reached!')
+        if seq != self.goal_seq_:   # [P1] result of a preempted goal
+            return
+        self.goal_finished(future.result().status)
+
+    def goal_finished(self, status):
+        """[P1] Book-keeping when the current Nav2 goal ends"""
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('Goal reached!')
+        else:
+            self.get_logger().warn(f'Goal ended with status {status}')
+        if self.explore_target_ is not None:
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.visited_goals_.append(tuple(self.explore_target_))
+            else:
+                self.record_failure(self.explore_target_, 1)
+            self.explore_target_ = None
         self.ready_for_next_goal_ = True
 
 
@@ -617,6 +681,195 @@ class CaveExplorer(Node):
         )
         self.planner_go_to_pose2d(goal_pose2d)
 
+    def now_s(self):
+        """[P1] Current (simulation) time in seconds"""
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def planner_explore_frontiers(self):
+        """
+        [P1] Frontier-based exploration, called from main_loop at 5 Hz.
+          - no goal running: pick the best frontier and send it to Nav2
+          - goal running: every replan_period re-evaluate the frontiers; switch (preempt) if the
+            target frontier has been mapped in the meantime or another one is now clearly better
+          - goal timeout / no progress: give up the goal, it will not be selected again
+          - no frontier left: exploration complete -> return home
+        """
+        pose = self.get_pose_2d()
+        if pose is None or self.map_grid_ is None:
+            return
+        now = self.now_s()
+        self.update_travel_stats(pose, now)
+
+        goal_running = not self.ready_for_next_goal_
+        force = False
+        if goal_running and self.explore_target_ is not None:
+            if now - self.goal_sent_time_ > self.goal_timeout_:
+                self.get_logger().warn('Exploration goal timed out -> next frontier')
+                force = True
+            elif now - self.progress_pose_[2] > self.stuck_time_:
+                self.get_logger().warn(f'No progress for {self.stuck_time_:.0f} s -> next frontier')
+                force = True
+            if force:   # a whole timeout was already spent on it: give it up at once
+                self.record_failure(self.explore_target_, self.max_attempts_)
+                self.explore_target_ = None
+        if goal_running and not force and now - self.last_replan_ < self.replan_period_:
+            return
+        self.last_replan_ = now
+
+        t0 = time.time()
+        excluded = [(x, y, self.visited_radius_) for x, y in self.visited_goals_] + \
+                   [(x, y, self.failed_radius_) for x, y, n in self.failed_goals_ if n >= self.max_attempts_]
+        info = self.map_info_
+        result = self.explorer_.compute(
+            self.map_grid_, info.resolution, (info.origin.position.x, info.origin.position.y),
+            (pose.x, pose.y), pose.theta, excluded=excluded, current_target=self.explore_target_)
+        compute_ms = 1000.0 * (time.time() - t0)
+        self.publish_exploration_markers(result, pose)
+        self.log_exploration(now, result)
+
+        best = result.best
+        if best is None:
+            if goal_running and self.explore_target_ is not None:
+                return   # keep going: the map update may lag behind
+            self.planner_type_ = PlannerType.EXPLORATION_DONE
+            elapsed = now - self.explore_start_
+            self.get_logger().warn(
+                f'Exploration complete: {result.free_area_m2:.0f} m2 free space mapped in {elapsed:.0f} s, '
+                f'{self.distance_travelled_:.0f} m travelled -> returning home')
+            self.publish_exploration_markers(result, pose, done=True)
+            self.planner_return_home()
+            return
+
+        # Keep the current goal as long as there is still something to explore around it: every
+        # preemption makes Nav2 re-plan, and the viewpoint of a large frontier moves while it shrinks
+        if goal_running and self.explore_target_ is not None and \
+                self.target_still_frontier(result):
+            return
+
+        self.get_logger().info(
+            f'Frontier selected: ({best.goal[0]:.1f}, {best.goal[1]:.1f}) size {best.size_m:.1f} m, '
+            f'path {best.path_dist:.1f} m, score {best.score:.1f} '
+            f'({len(result.frontiers)} candidates, {compute_ms:.0f} ms)')
+        self.explore_target_ = best.goal
+        # Generous timeout: 0.3 m/s average speed + 30 s for recoveries
+        self.goal_timeout_ = best.path_dist / 0.3 + 30.0
+        self.progress_pose_ = (pose.x, pose.y, now)
+        # Arrive facing away from the robot, i.e. looking into the unknown space behind the frontier
+        theta = math.atan2(best.goal[1] - pose.y, best.goal[0] - pose.x)
+        self.planner_go_to_pose2d(Pose2D(x=float(best.goal[0]), y=float(best.goal[1]), theta=theta))
+
+    def record_failure(self, goal, count):
+        """[P1] Count Nav2 failures per goal location, the goal is excluded after max_attempts"""
+        for entry in self.failed_goals_:
+            if math.hypot(entry[0] - goal[0], entry[1] - goal[1]) < self.failed_radius_:
+                entry[2] += count
+                return
+        self.failed_goals_.append([float(goal[0]), float(goal[1]), count])
+
+    def target_still_frontier(self, result):
+        """[P1] Are there still frontier cells near the goal we are driving to?"""
+        radius = 2.0 * self.explorer_.viewpoint_radius
+        for f in result.frontiers + result.rejected:
+            if np.min(np.hypot(f.cells[:, 0] - self.explore_target_[0],
+                               f.cells[:, 1] - self.explore_target_[1])) < radius:
+                return True
+        return False
+
+    def update_travel_stats(self, pose, now):
+        """[P1] Distance travelled and progress (for stuck detection)"""
+        if self.explore_start_ is None:
+            self.explore_start_ = now
+        if self.last_pose_ is not None:
+            self.distance_travelled_ += math.hypot(pose.x - self.last_pose_.x, pose.y - self.last_pose_.y)
+        self.last_pose_ = pose
+        if self.progress_pose_ is None or \
+                math.hypot(pose.x - self.progress_pose_[0], pose.y - self.progress_pose_[1]) > 0.5:
+            self.progress_pose_ = (pose.x, pose.y, now)
+
+    def log_exploration(self, now, result):
+        """[P1] Exploration progress as CSV (for the report: mapped area over time)"""
+        try:
+            if self.exploration_log_ is None:
+                os.makedirs(self.log_dir_, exist_ok=True)
+                path = os.path.join(self.log_dir_, time.strftime('exploration_%Y%m%d_%H%M%S.csv'))
+                self.exploration_log_ = open(path, 'w')
+                self.exploration_log_.write('time_s,known_area_m2,free_area_m2,n_frontiers,'
+                                            'distance_travelled_m,n_visited,n_failed\n')
+                self.get_logger().info(f'Logging exploration progress to {path}')
+            self.exploration_log_.write(
+                f'{now - self.explore_start_:.1f},{result.known_area_m2:.1f},{result.free_area_m2:.1f},'
+                f'{len(result.frontiers)},{self.distance_travelled_:.1f},'
+                f'{len(self.visited_goals_)},{sum(n >= self.max_attempts_ for *_, n in self.failed_goals_)}\n')
+            self.exploration_log_.flush()
+        except OSError as ex:
+            self.get_logger().warn(f'Cannot write exploration log: {ex}', once=True)
+
+    def publish_exploration_markers(self, result, pose, done=False):
+        """
+        [P1] RViz overlay of the exploration:
+          frontier cells (one colour per cluster), candidate viewpoints with their score,
+          chosen frontier + estimated path, visited (grey) and failed (red) goals, status text
+        """
+        stamp = self.get_clock().now().to_msg()
+
+        def marker(ns, mid, mtype, scale, rgba, z=0.0):
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp = stamp
+            m.ns, m.id, m.type, m.action = ns, mid, mtype, Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.pose.position.z = z
+            m.scale.x = m.scale.y = m.scale.z = scale
+            m.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3])
+            return m
+
+        palette = [(0.0, 0.8, 1.0), (1.0, 0.8, 0.0), (0.6, 0.3, 1.0), (0.0, 1.0, 0.5),
+                   (1.0, 0.4, 0.7), (0.5, 1.0, 0.0), (1.0, 0.5, 0.0), (0.3, 0.5, 1.0)]
+        clear = Marker()
+        clear.header.frame_id = 'map'
+        clear.action = Marker.DELETEALL
+        markers = [clear]
+        res = self.map_info_.resolution
+
+        cells = marker('frontier_cells', 0, Marker.CUBE_LIST, res, (1.0, 1.0, 1.0, 0.9), z=0.05)
+        for i, f in enumerate(result.frontiers + result.rejected):
+            c = palette[i % len(palette)] if i < len(result.frontiers) else (0.5, 0.5, 0.5)
+            for x, y in f.cells:
+                cells.points.append(Point(x=float(x), y=float(y)))
+                cells.colors.append(ColorRGBA(r=c[0], g=c[1], b=c[2], a=0.9))
+        markers.append(cells)
+
+        for i, f in enumerate(result.frontiers):
+            colour = (0.0, 1.0, 0.0, 1.0) if i == 0 else (1.0, 1.0, 1.0, 0.8)
+            sphere = marker('frontier_candidates', i, Marker.SPHERE, 0.8 if i == 0 else 0.4, colour, z=0.3)
+            sphere.pose.position.x, sphere.pose.position.y = float(f.goal[0]), float(f.goal[1])
+            text = marker('frontier_scores', i, Marker.TEXT_VIEW_FACING, 0.5, colour, z=1.2)
+            text.pose.position.x, text.pose.position.y = float(f.goal[0]), float(f.goal[1])
+            text.text = f'{f.score:.1f}'
+            markers += [sphere, text]
+
+        if result.path is not None:
+            line = marker('frontier_path', 0, Marker.LINE_STRIP, 0.1, (0.0, 1.0, 0.0, 0.8), z=0.2)
+            line.points = [Point(x=float(x), y=float(y)) for x, y in result.path]
+            markers.append(line)
+
+        failed = [(x, y) for x, y, n in self.failed_goals_ if n >= self.max_attempts_]
+        for ns, goals, colour in (('visited_goals', self.visited_goals_, (0.6, 0.6, 0.6, 0.8)),
+                                  ('failed_goals', failed, (1.0, 0.0, 0.0, 0.8))):
+            if goals:
+                m = marker(ns, 0, Marker.CUBE_LIST, 0.4, colour, z=0.2)
+                m.points = [Point(x=float(x), y=float(y)) for x, y in goals]
+                markers.append(m)
+
+        status = marker('exploration_status', 0, Marker.TEXT_VIEW_FACING, 0.8, (1.0, 1.0, 1.0, 1.0), z=2.5)
+        status.pose.position.x, status.pose.position.y = pose.x, pose.y
+        status.text = (f'EXPLORATION COMPLETE  {result.free_area_m2:.0f} m2' if done else
+                       f'{len(result.frontiers)} frontiers  {result.free_area_m2:.0f} m2  '
+                       f'{self.distance_travelled_:.0f} m')
+        markers.append(status)
+
+        self.exploration_marker_pub_.publish(MarkerArray(markers=markers))
+
     def main_loop(self):
         """
         Set the next goal pose and send to the action server
@@ -629,6 +882,13 @@ class CaveExplorer(Node):
                 'base_link',
                 rclpy.time.Time()):
             self.get_logger().warn('Waiting for transform... Have you launched a SLAM node?')
+            return
+
+        # [P1] Exploration runs continuously (re-plans while driving), not only when a goal is finished
+        if self.planner_type_ == PlannerType.EXPLORE_FRONTIERS:
+            self.planner_explore_frontiers()
+            return
+        if self.planner_type_ == PlannerType.EXPLORATION_DONE:
             return
 
         #######################################################
