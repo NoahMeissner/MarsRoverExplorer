@@ -36,8 +36,8 @@ from sklearn.cluster import DBSCAN  # [P3] clustering of repeated observations
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
-from cave_explorer.frontier_exploration import FrontierExplorer  # [P1]
-from cave_explorer.inspection import choose_viewpoint  # [P2]
+from cave_explorer.frontier_exploration import FrontierExplorer, OCCUPIED_THRESHOLD, wrap_pi  # [P1]
+from cave_explorer.inspection import choose_viewpoint, line_of_sight  # [P2]
 
 
 # [P3] Marker colour (r, g, b) per artefact class
@@ -48,6 +48,13 @@ ARTIFACT_COLOURS = {
     'mushroom': (1.0, 0.5, 0.0),
     'stone':    (0.6, 0.4, 0.2),
     'stop':     (1.0, 0.0, 0.0),
+}
+
+INSPECTION_STATUS_COLOURS = {
+    'pending':    (1.0, 0.6, 0.0),
+    'inspecting': (1.0, 1.0, 0.0),
+    'inspected':  (0.0, 1.0, 0.0),
+    'abandoned':  (1.0, 0.0, 0.0),
 }
 
 
@@ -266,6 +273,18 @@ class CaveExplorer(Node):
         self.last_seen_ = {}                 # label -> time it was last detected in the camera image
         self.last_annotated_image_ = None    # latest image with the detection boxes (RGB)
         self.inspection_marker_pub_ = self.create_publisher(MarkerArray, 'inspection_markers', 10)
+
+        self.inspect_visited_radius_ = q('visited_radius', 3.0)
+        self.inspect_max_attempts_ = q('max_attempts', 2)
+        self.lost_timeout_ = q('lost_timeout', 4.0)
+        self.inspect_timeout_margin_ = q('timeout_margin', 30.0)
+        self.no_viewpoint_cooldown_ = q('no_viewpoint_cooldown', 5.0)
+        self.resume_exploration_ = q('resume_exploration', True)
+        self.inspected_ = []
+        self.abandoned_ = []
+        self.inspect_cooldown_ = []
+        self.last_inspect_try_ = -math.inf
+        self.inspection_log_ = None
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
@@ -560,7 +579,11 @@ class CaveExplorer(Node):
         clear.header.frame_id = "map"
         clear.ns = "artifact_labels"
         clear.action = Marker.DELETEALL
-        marker_array.markers = [clear, self.marker_artifacts_]
+        clear_status = Marker()
+        clear_status.header.frame_id = "map"
+        clear_status.ns = "artifact_status"
+        clear_status.action = Marker.DELETEALL
+        marker_array.markers = [clear, clear_status, self.marker_artifacts_]
 
         # [P3] text label above each artifact
         for i, (point, label) in enumerate(zip(self.artifact_locations_, self.artifact_labels_)):
@@ -576,6 +599,24 @@ class CaveExplorer(Node):
             text.color.r = text.color.g = text.color.b = text.color.a = 1.0
             text.text = label
             marker_array.markers.append(text)
+
+            if label not in self.inspect_classes_:
+                continue
+            status = self.artefact_status(label, (point.x, point.y))
+            text.text = f'{label} ({status})'
+            ring = Marker()
+            ring.header.frame_id = "map"
+            ring.ns = "artifact_status"
+            ring.id = i
+            ring.type = Marker.CYLINDER
+            ring.action = Marker.ADD
+            ring.pose.position = Point(x=point.x, y=point.y, z=0.05)
+            ring.pose.orientation.w = 1.0
+            ring.scale.x = ring.scale.y = 2.0
+            ring.scale.z = 0.1
+            c = INSPECTION_STATUS_COLOURS[status]
+            ring.color = ColorRGBA(r=c[0], g=c[1], b=c[2], a=0.6)
+            marker_array.markers.append(ring)
 
         self.marker_pub_.publish(marker_array)
 
@@ -1081,22 +1122,31 @@ class CaveExplorer(Node):
         (DBSCAN cluster = at least 3 consistent observations) and a viewpoint can be computed,
         pause the exploration and switch to INSPECT_ARTEFACT
         """
-        targets = [(label, np.array([loc.x, loc.y]))
-                   for loc, label in zip(self.artifact_locations_, self.artifact_labels_)
-                   if label in self.inspect_classes_]
-        if not targets or self.map_grid_ is None:
+        if self.map_grid_ is None:
             return False
         now = self.now_s()
-        if self.inspect_ is not None and now - self.inspect_.get('last_try', -math.inf) < self.inspect_update_period_:
+        if now - self.last_inspect_try_ < self.inspect_update_period_:
             return False
         pose = self.get_pose_2d()
         if pose is None:
             return False
+        self.inspect_cooldown_ = [c for c in self.inspect_cooldown_ if c[3] > now]
+        targets = [(label, np.array([loc.x, loc.y]))
+                   for loc, label in zip(self.artifact_locations_, self.artifact_labels_)
+                   if label in self.inspect_classes_
+                   and self.artefact_status(label, (loc.x, loc.y)) == 'pending'
+                   and not any(l == label and math.hypot(loc.x - x, loc.y - y) < self.inspect_visited_radius_
+                               for l, x, y, _ in self.inspect_cooldown_)]
+        if not targets:
+            return False
+        self.last_inspect_try_ = now
         label, xy = min(targets, key=lambda t: math.hypot(t[1][0] - pose.x, t[1][1] - pose.y))
         self.inspect_ = {'label': label, 'xy': xy, 'phase': 'navigate', 'viewpoint': None, 'candidates': [],
-                         'failed': [], 'last_update': now, 'last_try': now, 'start': now,
+                         'failed': [], 'last_update': now, 'start': now, 'attempt': 1,
+                         'deadline': math.inf, 'last_ok': now,
                          'ticks': 0, 'seen_ticks': 0, 'align_start': None}
         if not self.send_viewpoint(pose):
+            self.inspect_cooldown_.append((label, float(xy[0]), float(xy[1]), now + self.no_viewpoint_cooldown_))
             self.get_logger().info(f'{label} at ({xy[0]:.1f}, {xy[1]:.1f}): no inspection viewpoint yet '
                                    f'(surroundings not mapped), exploring on', throttle_duration_sec=5.0)
             return False
@@ -1104,6 +1154,8 @@ class CaveExplorer(Node):
                                f'close-range inspection')
         self.planner_type_ = PlannerType.INSPECT_ARTEFACT
         self.explore_target_ = None   # the exploration goal is preempted, not failed
+        self.progress_pose_ = (pose.x, pose.y, now)
+        self.publish_artifact_markers()
         return True
 
     def send_viewpoint(self, pose):
@@ -1119,6 +1171,8 @@ class CaveExplorer(Node):
         self.publish_inspection_markers(pose)
         if best is None:
             return False
+        if not math.isfinite(insp['deadline']):
+            insp['deadline'] = self.now_s() + best.path_dist / 0.3 + self.inspect_timeout_margin_
         self.get_logger().info(f'Inspection viewpoint ({best.xy[0]:.1f}, {best.xy[1]:.1f}), '
                                f'{sum(c.valid for c in candidates)}/{len(candidates)} candidates valid, '
                                f'path {best.path_dist:.1f} m')
@@ -1135,29 +1189,83 @@ class CaveExplorer(Node):
                 best, best_d = np.array([loc.x, loc.y]), d
         return best
 
+    def artefact_status(self, label, xy):
+        for status, records in (('inspected', self.inspected_), ('abandoned', self.abandoned_)):
+            if any(l == label and math.hypot(x - xy[0], y - xy[1]) < self.inspect_visited_radius_
+                   for l, x, y in records):
+                return status
+        if self.planner_type_ == PlannerType.INSPECT_ARTEFACT and self.inspect_ is not None and \
+                self.inspect_['label'] == label and \
+                math.hypot(self.inspect_['xy'][0] - xy[0], self.inspect_['xy'][1] - xy[1]) < self.inspect_visited_radius_:
+            return 'inspecting'
+        return 'pending'
+
+    def camera_half_fov(self):
+        if self.camera_info_ is not None and self.camera_info_.k[0] > 0.0:
+            return math.atan(self.camera_info_.width / (2.0 * self.camera_info_.k[0]))
+        return self.get_parameter('camera_hfov').value / 2.0
+
+    def artefact_in_view(self, pose, xy):
+        to_art = np.asarray(xy) - np.array([pose.x, pose.y])
+        dist = float(np.hypot(*to_art))
+        err = wrap_pi(math.atan2(to_art[1], to_art[0]) - pose.theta)
+        if dist > self.standoff_ + 2.5 or abs(err) > self.camera_half_fov() - 0.15:
+            return False
+        info = self.map_info_
+        res, ox, oy = info.resolution, info.origin.position.x, info.origin.position.y
+        cell = lambda p: (int((p[1] - oy) / res), int((p[0] - ox) / res))
+        return line_of_sight(self.map_grid_ >= OCCUPIED_THRESHOLD, cell((pose.x, pose.y)), cell(xy),
+                             ignore_radius=1.0 / res)
+
     def planner_inspect_artefact(self):
         """
         [P2] 'navigate': Nav2 drives to the viewpoint; the artefact estimate is refreshed and the viewpoint
-                         re-planned if the estimate moves; if Nav2 fails, the next best viewpoint is tried
+                         re-planned if the estimate moves
              'align':    rotate on the spot until the camera faces the artefact, creep closer if Nav2
-                         stopped early (goal tolerance is 1 m), then the behaviour ends (INSPECTION_DONE)
+                         stopped early (goal tolerance is 1 m), done once the artefact is detected
+             'rewind':   collision while approaching, rewind then retry
         """
         pose = self.get_pose_2d()
         if pose is None:
             return
         now = self.now_s()
         insp = self.inspect_
+        self.update_travel_stats(pose, now)
         self.publish_virtual_obstacles(now)
+        if self.rewind_ is not None:
+            self.rewind_step(pose, now)
+            return
+        if insp['phase'] == 'rewind':
+            self.retry_or_abandon(pose, now, 'collision', exclude_viewpoint=True)
+            return
+
         to_art = insp['xy'] - np.array([pose.x, pose.y])
         dist = float(np.hypot(*to_art))
-        err = math.atan2(math.sin(math.atan2(to_art[1], to_art[0]) - pose.theta),
-                         math.cos(math.atan2(to_art[1], to_art[0]) - pose.theta))
+        err = wrap_pi(math.atan2(to_art[1], to_art[0]) - pose.theta)
+        seen = now - self.last_seen_.get(insp['label'], -math.inf) < 1.5
+
+        if seen or not self.artefact_in_view(pose, insp['xy']):
+            insp['last_ok'] = now
+        elif now - insp['last_ok'] > self.lost_timeout_:
+            self.retry_or_abandon(pose, now, f'artefact in view but not detected for {self.lost_timeout_:.0f} s')
+            return
 
         if insp['phase'] == 'navigate':
             insp['ticks'] += 1
-            if now - self.last_seen_.get(insp['label'], -math.inf) < 1.5:
+            if seen:
                 insp['seen_ticks'] += 1
+            if now > insp['deadline']:
+                self.retry_or_abandon(pose, now, 'timeout', exclude_viewpoint=True)
+                return
             if not self.ready_for_next_goal_:   # Nav2 still driving
+                if now - self.progress_pose_[2] > self.stuck_time_:
+                    if self.pushing_forward(self.progress_pose_[2]):
+                        self.get_logger().warn('Inspection: driving forward but no progress -> rewind')
+                        insp['phase'] = 'rewind'
+                        self.start_rewind(pose, now)
+                    else:
+                        self.retry_or_abandon(pose, now, 'no progress', exclude_viewpoint=True)
+                    return
                 if now - insp['last_update'] >= self.inspect_update_period_:
                     insp['last_update'] = now
                     new = self.closest_cluster(insp['label'], insp['xy'])
@@ -1165,18 +1273,17 @@ class CaveExplorer(Node):
                         self.get_logger().info(f'Artefact estimate moved to ({new[0]:.1f}, {new[1]:.1f}) '
                                                f'-> new viewpoint')
                         insp['xy'] = new
-                        self.send_viewpoint(pose)
+                        if not self.send_viewpoint(pose):
+                            self.retry_or_abandon(pose, now, 'no viewpoint for the new estimate')
                     else:
                         self.publish_inspection_markers(pose)
                 return
             if self.last_goal_status_ == GoalStatus.STATUS_SUCCEEDED:
                 insp['phase'], insp['align_start'] = 'align', now
                 self.get_logger().info(f'Viewpoint reached ({dist:.1f} m from the artefact) -> aligning')
+                self.publish_inspection_markers(pose)
                 return
-            insp['failed'].append(tuple(insp['viewpoint'].xy))
-            self.get_logger().warn('Nav2 could not reach the viewpoint -> next best viewpoint')
-            if not self.send_viewpoint(pose):
-                self.finish_inspection(pose, now, dist, err, success=False)
+            self.retry_or_abandon(pose, now, 'Nav2 could not reach the viewpoint', exclude_viewpoint=True)
             return
 
         # 'align'
@@ -1186,29 +1293,60 @@ class CaveExplorer(Node):
         elif dist > self.standoff_ + 0.3:
             cmd.linear.x = 0.2   # facing the artefact, free line of sight checked by the viewpoint choice
             cmd.angular.z = 0.5 * err
-        else:
-            self.finish_inspection(pose, now, dist, err, success=True)
+        elif now - self.last_seen_.get(insp['label'], -math.inf) < 2.0:
+            self.finish_inspection(pose, now, success=True)
             return
         if now - insp['align_start'] > 30.0:
-            self.finish_inspection(pose, now, dist, err, success=True)
+            self.retry_or_abandon(pose, now, 'alignment timeout')
             return
         self.cmd_vel_pub_.publish(cmd)
 
-    def finish_inspection(self, pose, now, dist, err, success):
-        """[P2] End of the Planning 2 behaviour: report, save the close-range image, stop"""
+    def stop_navigation(self):
+        self.goal_seq_ += 1
+        if self.nav_goal_handle_ is not None:
+            self.nav_goal_handle_.cancel_goal_async()
+            self.nav_goal_handle_ = None
         self.cmd_vel_pub_.publish(Twist())
+        self.ready_for_next_goal_ = True
+
+    def retry_or_abandon(self, pose, now, reason, exclude_viewpoint=False):
         insp = self.inspect_
-        insp['phase'] = 'done' if success else 'failed'
-        self.planner_type_ = PlannerType.INSPECTION_DONE
-        visible = now - self.last_seen_.get(insp['label'], -math.inf) < 3.0
+        self.stop_navigation()
+        if insp['attempt'] >= self.inspect_max_attempts_:
+            self.finish_inspection(pose, now, success=False, reason=reason)
+            return
+        insp['attempt'] += 1
+        if exclude_viewpoint and insp['viewpoint'] is not None:
+            insp['failed'].append(tuple(insp['viewpoint'].xy))
+        new = self.closest_cluster(insp['label'], insp['xy'])
+        if new is not None:
+            insp['xy'] = new
+        insp.update(phase='navigate', deadline=math.inf, last_ok=now, last_update=now, align_start=None)
+        self.progress_pose_ = (pose.x, pose.y, now)
+        self.get_logger().warn(f'Inspection of {insp["label"]}: {reason} -> retry '
+                               f'({insp["attempt"]}/{self.inspect_max_attempts_})')
+        if not self.send_viewpoint(pose):
+            self.finish_inspection(pose, now, success=False, reason=f'{reason}, no reachable viewpoint left')
+
+    def finish_inspection(self, pose, now, success, reason=''):
+        """[P2] End of the inspection: report, save the close-range image, record the artefact"""
+        self.stop_navigation()
+        insp = self.inspect_
+        insp['phase'] = 'done' if success else 'abandoned'
+        to_art = insp['xy'] - np.array([pose.x, pose.y])
+        dist = float(np.hypot(*to_art))
+        err = wrap_pi(math.atan2(to_art[1], to_art[0]) - pose.theta)
         in_view = 100.0 * insp['seen_ticks'] / max(1, insp['ticks'])
+        record = (insp['label'], float(insp['xy'][0]), float(insp['xy'][1]))
         if not success:
-            self.get_logger().error(f'Inspection of {insp["label"]} failed: no reachable viewpoint')
+            self.abandoned_.append(record)
+            self.get_logger().error(f'Inspection of {insp["label"]} abandoned after {insp["attempt"]} '
+                                    f'attempt(s): {reason}')
         else:
+            self.inspected_.append(record)
             self.get_logger().warn(
                 f'Inspection of {insp["label"]} done in {now - insp["start"]:.0f} s: {dist:.1f} m from the '
                 f'artefact, camera {abs(math.degrees(err)):.0f} deg off its centre, '
-                f'{"detected" if visible else "NOT detected"} in the latest images, '
                 f'detected during {in_view:.0f} % of the approach')
             if self.last_annotated_image_ is not None:
                 try:
@@ -1218,7 +1356,49 @@ class CaveExplorer(Node):
                     self.get_logger().info(f'Close-range image saved to {path}')
                 except (OSError, cv2.error) as ex:
                     self.get_logger().warn(f'Cannot save the inspection image: {ex}')
-        self.publish_inspection_markers(pose)
+        self.log_inspection(now, insp, success, reason, dist, err, in_view)
+
+        if self.resume_exploration_:
+            self.resume_exploration(pose, now)
+            clear = Marker()
+            clear.header.frame_id = 'map'
+            clear.action = Marker.DELETEALL
+            self.inspection_marker_pub_.publish(MarkerArray(markers=[clear]))
+        else:
+            self.planner_type_ = PlannerType.INSPECTION_DONE
+            self.publish_inspection_markers(pose)
+        self.publish_artifact_markers()
+        pending = sum(lab in self.inspect_classes_ and self.artefact_status(lab, (loc.x, loc.y)) == 'pending'
+                      for loc, lab in zip(self.artifact_locations_, self.artifact_labels_))
+        self.get_logger().warn(f'Artefacts: {len(self.inspected_)} inspected, {len(self.abandoned_)} abandoned, '
+                               f'{pending} pending')
+
+    def resume_exploration(self, pose, now):
+        self.get_logger().warn('Resuming exploration')
+        self.planner_type_ = PlannerType.EXPLORE_FRONTIERS
+        self.explore_target_ = None
+        self.ready_for_next_goal_ = True
+        self.last_replan_ = -math.inf
+        self.progress_pose_ = (pose.x, pose.y, now)
+        self.last_inspect_try_ = now
+
+    def log_inspection(self, now, insp, success, reason, dist, err, in_view):
+        try:
+            if self.inspection_log_ is None:
+                os.makedirs(self.log_dir_, exist_ok=True)
+                path = os.path.join(self.log_dir_, time.strftime('inspections_%Y%m%d_%H%M%S.csv'))
+                self.inspection_log_ = open(path, 'w')
+                self.inspection_log_.write('time_s,label,x,y,result,reason,attempts,duration_s,'
+                                           'distance_m,heading_error_deg,detected_pct\n')
+                self.get_logger().info(f'Logging inspections to {path}')
+            start = self.explore_start_ if self.explore_start_ is not None else now
+            self.inspection_log_.write(
+                f'{now - start:.1f},{insp["label"]},{insp["xy"][0]:.2f},{insp["xy"][1]:.2f},'
+                f'{"inspected" if success else "abandoned"},{reason.replace(",", ";")},{insp["attempt"]},'
+                f'{now - insp["start"]:.1f},{dist:.2f},{math.degrees(err):.1f},{in_view:.0f}\n')
+            self.inspection_log_.flush()
+        except OSError as ex:
+            self.get_logger().warn(f'Cannot write inspection log: {ex}', once=True)
 
     def publish_inspection_markers(self, pose):
         """[P2] RViz: inspected artefact, standoff circle, candidate viewpoints (green valid / red rejected),
@@ -1264,7 +1444,7 @@ class CaveExplorer(Node):
 
         text = marker('inspection_status', Marker.TEXT_VIEW_FACING, 0.6, (1.0, 1.0, 0.0, 1.0), z=2.0)
         text.pose.position.x, text.pose.position.y = ax, ay
-        text.text = f'INSPECT {insp["label"]}: {insp["phase"]}'
+        text.text = f'INSPECT {insp["label"]}: {insp["phase"]} ({insp["attempt"]}/{self.inspect_max_attempts_})'
         markers.append(text)
         self.inspection_marker_pub_.publish(MarkerArray(markers=markers))
 
