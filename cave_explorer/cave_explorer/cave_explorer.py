@@ -4,6 +4,7 @@ import math
 import os
 import random
 import time
+from collections import deque
 from enum import Enum
 import torch
 from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
@@ -16,11 +17,15 @@ import message_filters  # [P3] synchronise RGB + depth image
 from cv_bridge import CvBridge
 from action_msgs.msg import GoalStatus  # [P1]
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  # [P3] + PointStamped
+from geometry_msgs.msg import Twist  # [P1]
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo  # [P3] + CameraInfo
+from sensor_msgs.msg import PointCloud2  # [P1]
+from sensor_msgs_py import point_cloud2  # [P1]
+from std_msgs.msg import Header  # [P1]
 from std_msgs.msg import ColorRGBA  # [P3]
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -201,7 +206,12 @@ class CaveExplorer(Node):
         self.visited_radius_ = p('visited_radius', 1.5)     # [m] reached goals are not selected again
         self.failed_radius_ = p('failed_radius', 2.0)       # [m] goals Nav2 failed on are not selected again
         self.max_attempts_ = p('max_attempts', 2)           # Nav2 failures before a goal is given up
-        self.stuck_time_ = p('stuck_time', 20.0)            # [s] no progress for this long -> give up goal
+        self.stuck_time_ = p('stuck_time', 20.0)            # [s] no progress for this long -> rewind
+        self.rewind_distance_ = p('rewind_distance', 1.5)   # [m] driven back along the trajectory when stuck
+        self.rewind_speed_ = p('rewind_speed', 0.3)         # [m/s]
+        self.rewind_timeout_ = p('rewind_timeout', 12.0)    # [s] then escape manoeuvres are tried
+        self.obstacle_offset_ = p('obstacle_offset', 1.0)   # [m] virtual obstacle centre, ahead of the stuck robot
+        self.obstacle_radius_ = p('obstacle_radius', 0.7)   # [m] virtual obstacle radius
         self.log_dir_ = os.path.expanduser(p('log_dir', '~/cave_explorer_logs'))
         planner = self.declare_parameter('planner', 'explore').value   # 'explore' or 'template'
         if planner == 'explore':
@@ -220,6 +230,24 @@ class CaveExplorer(Node):
         self.distance_travelled_ = 0.0
         self.exploration_log_ = None
         self.exploration_marker_pub_ = self.create_publisher(MarkerArray, 'exploration_markers', 10)
+
+        # [P1] Stuck recovery ("rewind"): the lidar is mounted 1 m high and cannot see low artefacts
+        # (green crystals), so Nav2 can drive into them. When stuck, the robot drives back along its
+        # own trajectory and a virtual obstacle is added to the Nav2 costmaps (/virtual_obstacles,
+        # see nav2_params.yaml) so that the next path goes around it.
+        self.trail_ = deque(maxlen=500)  # [(x, y)] recorded trajectory, one point every 0.2 m
+        self.rewind_ = None              # dict while rewinding
+        self.n_rewinds_ = 0
+        self.nav_goal_handle_ = None     # to cancel the running Nav2 goal
+        self.virtual_obstacles_ = []     # [(x, y)]
+        self.last_obstacle_pub_ = -math.inf
+        self.cmd_vel_pub_ = self.create_publisher(Twist, 'cmd_vel', 10)
+        # A collision is "forward speed commanded but no movement"; Nav2 failing to plan (no command)
+        # must not create a virtual obstacle
+        self.cmd_vel_log_ = deque(maxlen=2000)   # [(t, linear.x)] commands received on cmd_vel
+        self.cmd_vel_sub_ = self.create_subscription(
+            Twist, 'cmd_vel', lambda m: self.cmd_vel_log_.append((self.now_s(), m.linear.x)), 10)
+        self.virtual_obstacle_pub_ = self.create_publisher(PointCloud2, 'virtual_obstacles', 1)
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
@@ -573,6 +601,7 @@ class CaveExplorer(Node):
 
         # Goal accepted: get result when it's completed
         self.get_logger().warn(f'Goal accepted')
+        self.nav_goal_handle_ = goal_handle   # [P1]
         self.get_result_future_ = goal_handle.get_result_async()
         self.get_result_future_.add_done_callback(lambda f: self.goal_reached_callback(f, seq))
 
@@ -693,7 +722,8 @@ class CaveExplorer(Node):
           - no goal running: pick the best frontier and send it to Nav2
           - goal running: every replan_period re-evaluate the frontiers; switch (preempt) if the
             target frontier has been mapped in the meantime or another one is now clearly better
-          - goal timeout / no progress: give up the goal, it will not be selected again
+          - goal timeout: give up the goal, it will not be selected again
+          - robot not moving: rewind along the trajectory + virtual obstacle, then retry
           - no frontier left: exploration complete -> return home
         """
         pose = self.get_pose_2d()
@@ -701,6 +731,10 @@ class CaveExplorer(Node):
             return
         now = self.now_s()
         self.update_travel_stats(pose, now)
+        self.publish_virtual_obstacles(now)
+        if self.rewind_ is not None:
+            self.rewind_step(pose, now)
+            return
 
         goal_running = not self.ready_for_next_goal_
         force = False
@@ -709,8 +743,17 @@ class CaveExplorer(Node):
                 self.get_logger().warn('Exploration goal timed out -> next frontier')
                 force = True
             elif now - self.progress_pose_[2] > self.stuck_time_:
-                self.get_logger().warn(f'No progress for {self.stuck_time_:.0f} s -> next frontier')
+                if self.pushing_forward(self.progress_pose_[2]):
+                    self.get_logger().warn(f'Driving forward but no progress for {self.stuck_time_:.0f} s '
+                                           f'-> collision with an obstacle the lidar cannot see -> rewind')
+                    self.record_failure(self.explore_target_, 1)   # retried once, around the obstacle
+                    self.explore_target_ = None
+                    self.start_rewind(pose, now)
+                    return
+                self.get_logger().warn(f'No progress for {self.stuck_time_:.0f} s (Nav2 not driving) '
+                                       f'-> next frontier')
                 force = True
+                self.progress_pose_ = (pose.x, pose.y, now)
             if force:   # a whole timeout was already spent on it: give it up at once
                 self.record_failure(self.explore_target_, self.max_attempts_)
                 self.explore_target_ = None
@@ -723,7 +766,7 @@ class CaveExplorer(Node):
                    [(x, y, self.failed_radius_) for x, y, n in self.failed_goals_ if n >= self.max_attempts_]
         info = self.map_info_
         result = self.explorer_.compute(
-            self.map_grid_, info.resolution, (info.origin.position.x, info.origin.position.y),
+            self.grid_with_virtual_obstacles(), info.resolution, (info.origin.position.x, info.origin.position.y),
             (pose.x, pose.y), pose.theta, excluded=excluded, current_target=self.explore_target_)
         compute_ms = 1000.0 * (time.time() - t0)
         self.publish_exploration_markers(result, pose)
@@ -755,7 +798,6 @@ class CaveExplorer(Node):
         self.explore_target_ = best.goal
         # Generous timeout: 0.3 m/s average speed + 30 s for recoveries
         self.goal_timeout_ = best.path_dist / 0.3 + 30.0
-        self.progress_pose_ = (pose.x, pose.y, now)
         # Arrive facing away from the robot, i.e. looking into the unknown space behind the frontier
         theta = math.atan2(best.goal[1] - pose.y, best.goal[0] - pose.x)
         self.planner_go_to_pose2d(Pose2D(x=float(best.goal[0]), y=float(best.goal[1]), theta=theta))
@@ -787,6 +829,135 @@ class CaveExplorer(Node):
         if self.progress_pose_ is None or \
                 math.hypot(pose.x - self.progress_pose_[0], pose.y - self.progress_pose_[1]) > 0.5:
             self.progress_pose_ = (pose.x, pose.y, now)
+        if not self.trail_ or math.hypot(pose.x - self.trail_[-1][0], pose.y - self.trail_[-1][1]) > 0.2:
+            self.trail_.append((pose.x, pose.y))
+
+    def finish_rewind(self, pose, now, outcome):
+        """[P1] Stop the robot and hand back to the exploration"""
+        self.cmd_vel_pub_.publish(Twist())
+        if outcome is None:
+            self.get_logger().error('Rewind failed: the robot could not free itself')
+        else:
+            self.get_logger().info(f'Rewind done ({outcome}), resuming exploration')
+        self.rewind_ = None
+        self.ready_for_next_goal_ = True
+        self.last_replan_ = -math.inf
+        self.progress_pose_ = (pose.x, pose.y, now)
+
+    def pushing_forward(self, since):
+        """[P1] Was a forward speed commanded most of the time since `since`?"""
+        cmds = [v for t, v in self.cmd_vel_log_ if t >= since]
+        return len(cmds) >= 10 and sum(v > 0.15 for v in cmds) > 0.5 * len(cmds)
+
+    # [P1] Tried one after the other (linear m/s, angular rad/s) if driving back along the trail fails:
+    # in tests the robot caught on a crystal by its side could not reverse straight but got free when turning
+    ESCAPE_MANOEUVRES = [(-0.3, 0.6), (-0.3, -0.6), (0.0, 0.8), (0.0, -0.8), (0.3, 0.6), (0.3, -0.6)]
+    ESCAPE_DURATION = 4.0   # [s] per manoeuvre
+    ESCAPE_DISTANCE = 0.6   # [m] the robot is free once it moved this far
+
+    def start_rewind(self, pose, now):
+        """[P1] Stuck: virtual obstacle in front of the robot, cancel Nav2, drive back along the trail"""
+        # The robot was commanded forward (pushing_forward), so the obstacle is in front of it
+        heading = pose.theta
+        obstacle = (pose.x + self.obstacle_offset_ * math.cos(heading),
+                    pose.y + self.obstacle_offset_ * math.sin(heading))
+        if all(math.hypot(obstacle[0] - x, obstacle[1] - y) > 0.5 for x, y in self.virtual_obstacles_):
+            self.virtual_obstacles_.append(obstacle)
+            self.last_obstacle_pub_ = -math.inf   # publish it right away
+
+        # Cancel the Nav2 goal, its result is ignored (new goal id)
+        self.goal_seq_ += 1
+        if self.nav_goal_handle_ is not None:
+            self.nav_goal_handle_.cancel_goal_async()
+            self.nav_goal_handle_ = None
+
+        # Waypoints: the recorded trajectory, backwards, over rewind_distance
+        waypoints, travelled, prev = [], 0.0, (pose.x, pose.y)
+        for x, y in reversed(self.trail_):
+            travelled += math.hypot(x - prev[0], y - prev[1])
+            prev = (x, y)
+            waypoints.append((x, y))
+            if travelled >= self.rewind_distance_:
+                break
+        if travelled < 0.5 * self.rewind_distance_:   # no trajectory recorded: straight back
+            waypoints.append((pose.x - self.rewind_distance_ * math.cos(heading),
+                              pose.y - self.rewind_distance_ * math.sin(heading)))
+        self.rewind_ = {'waypoints': waypoints, 'idx': 0, 'start': now, 'start_xy': (pose.x, pose.y),
+                        'phase': 'trail', 'manoeuvre': 0, 'phase_start': now}
+        self.n_rewinds_ += 1
+        self.get_logger().warn(f'Rewind #{self.n_rewinds_}: virtual obstacle at ({obstacle[0]:.1f}, '
+                               f'{obstacle[1]:.1f}), driving {self.rewind_distance_:.1f} m back along the trajectory')
+
+    def rewind_step(self, pose, now):
+        """
+        [P1] 1) follow the trail waypoints back with whichever end of the robot faces them (usually the rear)
+             2) if that does not free the robot within rewind_timeout: escape manoeuvres, one after the other
+        """
+        rw = self.rewind_
+        wps = rw['waypoints']
+        moved = math.hypot(pose.x - rw['start_xy'][0], pose.y - rw['start_xy'][1])
+        cmd = Twist()
+        if rw['phase'] == 'escape':
+            if moved >= self.ESCAPE_DISTANCE:
+                self.finish_rewind(pose, now, f'free after escape manoeuvre {rw["manoeuvre"] + 1}')
+                return
+            if now - rw['phase_start'] > self.ESCAPE_DURATION:
+                rw['manoeuvre'] += 1
+                rw['phase_start'] = now
+            if rw['manoeuvre'] >= len(self.ESCAPE_MANOEUVRES):
+                self.finish_rewind(pose, now, None)
+                return
+            cmd.linear.x, cmd.angular.z = self.ESCAPE_MANOEUVRES[rw['manoeuvre']]
+            self.cmd_vel_pub_.publish(cmd)
+            return
+
+        while rw['idx'] < len(wps) and \
+                math.hypot(wps[rw['idx']][0] - pose.x, wps[rw['idx']][1] - pose.y) < 0.3:
+            rw['idx'] += 1
+        if rw['idx'] >= len(wps):
+            self.finish_rewind(pose, now, f'{moved:.1f} m back along the trajectory')
+            return
+        if now - rw['phase_start'] > self.rewind_timeout_:
+            if moved >= self.ESCAPE_DISTANCE:
+                self.finish_rewind(pose, now, f'{moved:.1f} m back along the trajectory')
+            else:
+                self.get_logger().warn('Rewind along the trajectory did not free the robot -> escape manoeuvres')
+                rw['phase'], rw['phase_start'] = 'escape', now
+            return
+        tx, ty = wps[rw['idx']]
+        bearing = math.atan2(ty - pose.y, tx - pose.x)
+        err_front = math.atan2(math.sin(bearing - pose.theta), math.cos(bearing - pose.theta))
+        err_rear = math.atan2(math.sin(bearing - pose.theta - math.pi), math.cos(bearing - pose.theta - math.pi))
+        direction, err = (-1.0, err_rear) if abs(err_rear) <= abs(err_front) else (1.0, err_front)
+        cmd.linear.x = direction * self.rewind_speed_ * max(0.2, math.cos(err))
+        cmd.angular.z = max(-0.6, min(0.6, 1.0 * err))
+        self.cmd_vel_pub_.publish(cmd)
+
+    def publish_virtual_obstacles(self, now):
+        """[P1] Virtual obstacles as a point cloud (a disc of points each), re-published every second
+        because Nav2's clear-costmap recoveries wipe the obstacle layer"""
+        if now - self.last_obstacle_pub_ < 1.0:
+            return   # (an empty cloud is published too: it removes obstacles left by a previous run)
+        self.last_obstacle_pub_ = now
+        step, r = 0.15, self.obstacle_radius_
+        offsets = [(dx, dy) for dx in np.arange(-r, r + 1e-6, step) for dy in np.arange(-r, r + 1e-6, step)
+                   if dx * dx + dy * dy <= r * r]
+        points = [(float(ox + dx), float(oy + dy), 0.5) for ox, oy in self.virtual_obstacles_ for dx, dy in offsets]
+        header = Header(frame_id='map', stamp=self.get_clock().now().to_msg())
+        self.virtual_obstacle_pub_.publish(point_cloud2.create_cloud_xyz32(header, points))
+
+    def grid_with_virtual_obstacles(self):
+        """[P1] SLAM grid with the virtual obstacles marked occupied, for the frontier planner"""
+        if not self.virtual_obstacles_:
+            return self.map_grid_
+        grid = self.map_grid_.copy()
+        info = self.map_info_
+        res, ox, oy = info.resolution, info.origin.position.x, info.origin.position.y
+        rows, cols = np.ogrid[:grid.shape[0], :grid.shape[1]]
+        for x, y in self.virtual_obstacles_:
+            r, c = (y - oy) / res, (x - ox) / res
+            grid[(rows - r) ** 2 + (cols - c) ** 2 <= (self.obstacle_radius_ / res) ** 2] = 100
+        return grid
 
     def log_exploration(self, now, result):
         """[P1] Exploration progress as CSV (for the report: mapped area over time)"""
@@ -862,6 +1033,12 @@ class CaveExplorer(Node):
                 m = marker(ns, 0, Marker.CUBE_LIST, 0.4, colour, z=0.2)
                 m.points = [Point(x=float(x), y=float(y)) for x, y in goals]
                 markers.append(m)
+
+        for i, (x, y) in enumerate(self.virtual_obstacles_):
+            m = marker('virtual_obstacles', i, Marker.CYLINDER, 2.0 * self.obstacle_radius_, (1.0, 0.2, 0.0, 0.6), z=0.5)
+            m.scale.z = 1.0
+            m.pose.position.x, m.pose.position.y = float(x), float(y)
+            markers.append(m)
 
         status = marker('exploration_status', 0, Marker.TEXT_VIEW_FACING, 0.8, (1.0, 1.0, 1.0, 1.0), z=2.5)
         status.pose.position.x, status.pose.position.y = pose.x, pose.y
