@@ -37,6 +37,7 @@ from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
 from cave_explorer.frontier_exploration import FrontierExplorer  # [P1]
+from cave_explorer.inspection import choose_viewpoint  # [P2]
 
 
 # [P3] Marker colour (r, g, b) per artefact class
@@ -82,6 +83,8 @@ class PlannerType(Enum):
     RANDOM_GOAL = 5
     EXPLORE_FRONTIERS = 6   # [P1] frontier-based exploration
     EXPLORATION_DONE = 7    # [P1] no frontier left, returned home
+    INSPECT_ARTEFACT = 8    # [P2] close-range inspection of a detected artefact
+    INSPECTION_DONE = 9     # [P2] robot at the inspection viewpoint, behaviour ends here
     # Add more!
 
 
@@ -249,6 +252,21 @@ class CaveExplorer(Node):
             Twist, 'cmd_vel', lambda m: self.cmd_vel_log_.append((self.now_s(), m.linear.x)), 10)
         self.virtual_obstacle_pub_ = self.create_publisher(PointCloud2, 'virtual_obstacles', 1)
 
+        # [P2] Close-range inspection of chosen artefact types (see inspection.py). Classes chosen from the
+        # detection logs of 5 exploration runs: alien 99 %, ball 99 %, mushroom 94 % of the localised
+        # detections within 1.5 m of a real artefact of that type. 'stone' (green crystals) left out:
+        # the robot gets stuck on them.
+        q = lambda name, default: self.declare_parameter('inspection.' + name, default).value
+        self.inspect_classes_ = [c for c in q('target_classes', ['alien', 'ball', 'mushroom']) if c]
+        self.standoff_ = q('standoff', 2.0)                 # [m] distance from the artefact centre
+        self.inspect_update_period_ = q('update_period', 1.0)   # [s] re-check the artefact estimate
+        self.align_tolerance_ = q('align_tolerance', 0.15)  # [rad] final heading error
+        self.inspect_ = None                 # dict while inspecting
+        self.last_goal_status_ = None
+        self.last_seen_ = {}                 # label -> time it was last detected in the camera image
+        self.last_annotated_image_ = None    # latest image with the detection boxes (RGB)
+        self.inspection_marker_pub_ = self.create_publisher(MarkerArray, 'inspection_markers', 10)
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
 
@@ -357,6 +375,12 @@ class CaveExplorer(Node):
         # Publish the image with the detection bounding boxes
         image_detection_message = self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8")
         self.image_detections_pub_.publish(image_detection_message)
+
+        # [P2] When was each class last seen in the camera, and the latest annotated image
+        now = self.now_s()
+        for label in labels:
+            self.last_seen_[label] = now
+        self.last_annotated_image_ = image
 
         if self.artifact_found_:
             self.get_logger().info('Artifact found!')
@@ -621,6 +645,7 @@ class CaveExplorer(Node):
 
     def goal_finished(self, status):
         """[P1] Book-keeping when the current Nav2 goal ends"""
+        self.last_goal_status_ = status   # [P2]
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Goal reached!')
         else:
@@ -1049,6 +1074,200 @@ class CaveExplorer(Node):
 
         self.exploration_marker_pub_.publish(MarkerArray(markers=markers))
 
+    # ------------------------------------------------------------------ [P2] close-range inspection
+    def start_inspection(self):
+        """
+        [P2] Called while exploring: if Perception 3 has localised an artefact of a chosen class
+        (DBSCAN cluster = at least 3 consistent observations) and a viewpoint can be computed,
+        pause the exploration and switch to INSPECT_ARTEFACT
+        """
+        targets = [(label, np.array([loc.x, loc.y]))
+                   for loc, label in zip(self.artifact_locations_, self.artifact_labels_)
+                   if label in self.inspect_classes_]
+        if not targets or self.map_grid_ is None:
+            return False
+        now = self.now_s()
+        if self.inspect_ is not None and now - self.inspect_.get('last_try', -math.inf) < self.inspect_update_period_:
+            return False
+        pose = self.get_pose_2d()
+        if pose is None:
+            return False
+        label, xy = min(targets, key=lambda t: math.hypot(t[1][0] - pose.x, t[1][1] - pose.y))
+        self.inspect_ = {'label': label, 'xy': xy, 'phase': 'navigate', 'viewpoint': None, 'candidates': [],
+                         'failed': [], 'last_update': now, 'last_try': now, 'start': now,
+                         'ticks': 0, 'seen_ticks': 0, 'align_start': None}
+        if not self.send_viewpoint(pose):
+            self.get_logger().info(f'{label} at ({xy[0]:.1f}, {xy[1]:.1f}): no inspection viewpoint yet '
+                                   f'(surroundings not mapped), exploring on', throttle_duration_sec=5.0)
+            return False
+        self.get_logger().warn(f'{label} detected at ({xy[0]:.1f}, {xy[1]:.1f}) -> exploration paused, '
+                               f'close-range inspection')
+        self.planner_type_ = PlannerType.INSPECT_ARTEFACT
+        self.explore_target_ = None   # the exploration goal is preempted, not failed
+        return True
+
+    def send_viewpoint(self, pose):
+        """[P2] Choose the best viewpoint around the artefact and send it to Nav2"""
+        insp = self.inspect_
+        info = self.map_info_
+        best, candidates = choose_viewpoint(
+            self.grid_with_virtual_obstacles(), info.resolution, (info.origin.position.x, info.origin.position.y),
+            (pose.x, pose.y), insp['xy'], standoff=self.standoff_, min_clearance=self.explorer_.min_clearance,
+            excluded=insp['failed'])
+        insp['candidates'] = candidates
+        insp['viewpoint'] = best
+        self.publish_inspection_markers(pose)
+        if best is None:
+            return False
+        self.get_logger().info(f'Inspection viewpoint ({best.xy[0]:.1f}, {best.xy[1]:.1f}), '
+                               f'{sum(c.valid for c in candidates)}/{len(candidates)} candidates valid, '
+                               f'path {best.path_dist:.1f} m')
+        self.planner_go_to_pose2d(Pose2D(x=float(best.xy[0]), y=float(best.xy[1]), theta=best.yaw))
+        return True
+
+    def closest_cluster(self, label, xy, max_dist=2.0):
+        """[P2] Current Perception 3 estimate of the artefact we are inspecting (clusters are recomputed
+        at every detection, so the artefact is tracked by class + proximity)"""
+        best, best_d = None, max_dist
+        for loc, lab in zip(self.artifact_locations_, self.artifact_labels_):
+            d = math.hypot(loc.x - xy[0], loc.y - xy[1])
+            if lab == label and d < best_d:
+                best, best_d = np.array([loc.x, loc.y]), d
+        return best
+
+    def planner_inspect_artefact(self):
+        """
+        [P2] 'navigate': Nav2 drives to the viewpoint; the artefact estimate is refreshed and the viewpoint
+                         re-planned if the estimate moves; if Nav2 fails, the next best viewpoint is tried
+             'align':    rotate on the spot until the camera faces the artefact, creep closer if Nav2
+                         stopped early (goal tolerance is 1 m), then the behaviour ends (INSPECTION_DONE)
+        """
+        pose = self.get_pose_2d()
+        if pose is None:
+            return
+        now = self.now_s()
+        insp = self.inspect_
+        self.publish_virtual_obstacles(now)
+        to_art = insp['xy'] - np.array([pose.x, pose.y])
+        dist = float(np.hypot(*to_art))
+        err = math.atan2(math.sin(math.atan2(to_art[1], to_art[0]) - pose.theta),
+                         math.cos(math.atan2(to_art[1], to_art[0]) - pose.theta))
+
+        if insp['phase'] == 'navigate':
+            insp['ticks'] += 1
+            if now - self.last_seen_.get(insp['label'], -math.inf) < 1.5:
+                insp['seen_ticks'] += 1
+            if not self.ready_for_next_goal_:   # Nav2 still driving
+                if now - insp['last_update'] >= self.inspect_update_period_:
+                    insp['last_update'] = now
+                    new = self.closest_cluster(insp['label'], insp['xy'])
+                    if new is not None and np.hypot(*(new - insp['xy'])) > 0.5:
+                        self.get_logger().info(f'Artefact estimate moved to ({new[0]:.1f}, {new[1]:.1f}) '
+                                               f'-> new viewpoint')
+                        insp['xy'] = new
+                        self.send_viewpoint(pose)
+                    else:
+                        self.publish_inspection_markers(pose)
+                return
+            if self.last_goal_status_ == GoalStatus.STATUS_SUCCEEDED:
+                insp['phase'], insp['align_start'] = 'align', now
+                self.get_logger().info(f'Viewpoint reached ({dist:.1f} m from the artefact) -> aligning')
+                return
+            insp['failed'].append(tuple(insp['viewpoint'].xy))
+            self.get_logger().warn('Nav2 could not reach the viewpoint -> next best viewpoint')
+            if not self.send_viewpoint(pose):
+                self.finish_inspection(pose, now, dist, err, success=False)
+            return
+
+        # 'align'
+        cmd = Twist()
+        if abs(err) > self.align_tolerance_:
+            cmd.angular.z = max(-0.4, min(0.4, 1.0 * err))
+        elif dist > self.standoff_ + 0.3:
+            cmd.linear.x = 0.2   # facing the artefact, free line of sight checked by the viewpoint choice
+            cmd.angular.z = 0.5 * err
+        else:
+            self.finish_inspection(pose, now, dist, err, success=True)
+            return
+        if now - insp['align_start'] > 30.0:
+            self.finish_inspection(pose, now, dist, err, success=True)
+            return
+        self.cmd_vel_pub_.publish(cmd)
+
+    def finish_inspection(self, pose, now, dist, err, success):
+        """[P2] End of the Planning 2 behaviour: report, save the close-range image, stop"""
+        self.cmd_vel_pub_.publish(Twist())
+        insp = self.inspect_
+        insp['phase'] = 'done' if success else 'failed'
+        self.planner_type_ = PlannerType.INSPECTION_DONE
+        visible = now - self.last_seen_.get(insp['label'], -math.inf) < 3.0
+        in_view = 100.0 * insp['seen_ticks'] / max(1, insp['ticks'])
+        if not success:
+            self.get_logger().error(f'Inspection of {insp["label"]} failed: no reachable viewpoint')
+        else:
+            self.get_logger().warn(
+                f'Inspection of {insp["label"]} done in {now - insp["start"]:.0f} s: {dist:.1f} m from the '
+                f'artefact, camera {abs(math.degrees(err)):.0f} deg off its centre, '
+                f'{"detected" if visible else "NOT detected"} in the latest images, '
+                f'detected during {in_view:.0f} % of the approach')
+            if self.last_annotated_image_ is not None:
+                try:
+                    os.makedirs(self.log_dir_, exist_ok=True)
+                    path = os.path.join(self.log_dir_, time.strftime(f'inspection_{insp["label"]}_%H%M%S.png'))
+                    cv2.imwrite(path, cv2.cvtColor(self.last_annotated_image_, cv2.COLOR_RGB2BGR))
+                    self.get_logger().info(f'Close-range image saved to {path}')
+                except (OSError, cv2.error) as ex:
+                    self.get_logger().warn(f'Cannot save the inspection image: {ex}')
+        self.publish_inspection_markers(pose)
+
+    def publish_inspection_markers(self, pose):
+        """[P2] RViz: inspected artefact, standoff circle, candidate viewpoints (green valid / red rejected),
+        chosen viewpoint (arrow = camera heading), state text"""
+        insp = self.inspect_
+        stamp = self.get_clock().now().to_msg()
+
+        def marker(ns, mtype, scale, rgba, mid=0, z=0.0):
+            m = Marker()
+            m.header.frame_id, m.header.stamp = 'map', stamp
+            m.ns, m.id, m.type, m.action = ns, mid, mtype, Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.pose.position.z = z
+            m.scale.x = m.scale.y = m.scale.z = scale
+            m.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3])
+            return m
+
+        clear = Marker()
+        clear.header.frame_id = 'map'
+        clear.action = Marker.DELETEALL
+        markers = [clear]
+        ax, ay = float(insp['xy'][0]), float(insp['xy'][1])
+
+        target = marker('inspection_target', Marker.SPHERE, 0.7, (1.0, 1.0, 0.0, 0.9), z=0.5)
+        target.pose.position.x, target.pose.position.y = ax, ay
+        circle = marker('inspection_standoff', Marker.LINE_STRIP, 0.05, (1.0, 1.0, 0.0, 0.6), z=0.1)
+        circle.points = [Point(x=ax + self.standoff_ * math.cos(a), y=ay + self.standoff_ * math.sin(a))
+                         for a in np.linspace(0.0, 2.0 * math.pi, 49)]
+        cands = marker('inspection_candidates', Marker.SPHERE_LIST, 0.25, (1.0, 1.0, 1.0, 1.0), z=0.2)
+        for c in insp['candidates']:
+            cands.points.append(Point(x=float(c.xy[0]), y=float(c.xy[1])))
+            cands.colors.append(ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.9) if c.valid else
+                                ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.6))
+        markers += [target, circle, cands]
+
+        vp = insp['viewpoint']
+        if vp is not None:
+            arrow = marker('inspection_viewpoint', Marker.ARROW, 1.0, (1.0, 0.0, 1.0, 1.0), z=0.3)
+            arrow.scale.y = arrow.scale.z = 0.2
+            arrow.pose.position.x, arrow.pose.position.y = float(vp.xy[0]), float(vp.xy[1])
+            arrow.pose.orientation.z, arrow.pose.orientation.w = math.sin(vp.yaw / 2.0), math.cos(vp.yaw / 2.0)
+            markers.append(arrow)
+
+        text = marker('inspection_status', Marker.TEXT_VIEW_FACING, 0.6, (1.0, 1.0, 0.0, 1.0), z=2.0)
+        text.pose.position.x, text.pose.position.y = ax, ay
+        text.text = f'INSPECT {insp["label"]}: {insp["phase"]}'
+        markers.append(text)
+        self.inspection_marker_pub_.publish(MarkerArray(markers=markers))
+
     def main_loop(self):
         """
         Set the next goal pose and send to the action server
@@ -1065,9 +1284,14 @@ class CaveExplorer(Node):
 
         # [P1] Exploration runs continuously (re-plans while driving), not only when a goal is finished
         if self.planner_type_ == PlannerType.EXPLORE_FRONTIERS:
+            if self.rewind_ is None and self.start_inspection():   # [P2] chosen artefact detected
+                return
             self.planner_explore_frontiers()
             return
-        if self.planner_type_ == PlannerType.EXPLORATION_DONE:
+        if self.planner_type_ == PlannerType.INSPECT_ARTEFACT:      # [P2]
+            self.planner_inspect_artefact()
+            return
+        if self.planner_type_ in (PlannerType.EXPLORATION_DONE, PlannerType.INSPECTION_DONE):
             return
 
         #######################################################
