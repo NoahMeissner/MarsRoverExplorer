@@ -32,12 +32,21 @@ def generate_launch_description():
         executable='cave_explorer',
         output='screen',
         parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
-                     'print_feedback': LaunchConfiguration('print_feedback'),
-                    'computer_vision_model_filename': PathJoinSubstitution(config_path+['best.pt'])}]
+                'print_feedback': LaunchConfiguration('print_feedback'),
+                'computer_vision_model_filename': PathJoinSubstitution(config_path+['best.pt']),
+                'degrade': True}]
     )
 
     ld.add_action(use_sim_time_launch_arg)
     ld.add_action(print_feedback_launch_arg)
     ld.add_action(cave_explorer_node)
+
+    cave_geometry_node = Node(
+    package='cave_explorer',
+    executable='cave_geometry',
+    output='screen',
+    parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}]
+    )
+    ld.add_action(cave_geometry_node)
 
     return ld

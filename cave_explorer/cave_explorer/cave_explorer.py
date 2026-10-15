@@ -2,6 +2,7 @@
 
 import math
 import random
+import time
 from enum import Enum
 import torch
 from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
@@ -177,6 +178,13 @@ class CaveExplorer(Node):
         self.declare_parameter('camera_hfov', 2.0944)  # 120 deg, <horizontal_fov> in urdf/mars_explorer.gazebo.xacro (used if no CameraInfo arrives)
         self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
 
+        # [A1] Simulated camera degradation (dirty lens). True: every image is degraded
+        # before detection, False: clean images. Set in the launch file: 'degrade': True
+        self.declare_parameter('degrade', False)
+        self.degrade_ = self.get_parameter('degrade').value
+        self.dirt_mask_ = None   # created once for the image size (same dirt on every frame)
+        self.get_logger().info(f'[A1] degrade = {self.degrade_}')
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
 
@@ -252,21 +260,15 @@ class CaveExplorer(Node):
         # Create a grayscale version (some simple models use this)
         # image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # Retrieve the pre-trained model
-        stop_sign_model = self.computer_vision_model_
-
-        # Detect artifacts in the image
-        # The minSize is used to avoid very small detections that are probably noise
-        with torch.no_grad():
-            out = stop_sign_model([TF.to_tensor(image)])[0]
-        detections = []
-        labels = []
-        for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
-            if score < 0.5:  # CONF from the notebook
-                continue
-            x1, y1, x2, y2 = box.tolist()
-            detections.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
-            labels.append(self.class_names_[int(label) - 1])
+        # [A1] Optionally degrade the image (dirty lens), then run the detector ONCE
+        t0 = time.time()
+        if self.degrade_:
+            image = self.degrade(image)
+        t1 = time.time()
+        detections, labels = self.run_detector(image)
+        t2 = time.time()
+        self.get_logger().info(f'[A1] timing: degrade {1000 * (t1 - t0):.0f} ms | detector {1000 * (t2 - t1):.0f} ms',
+                               throttle_duration_sec=10.0)
 
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
         # You may want to communicate more information
@@ -280,12 +282,10 @@ class CaveExplorer(Node):
         else:
             self.artifact_found_ = False
 
-        # Draw a bounding box rectangle on the image for each detection
-        for(x, y, width, height) in detections:
-            cv2.rectangle(image, (x, y), (x + width, y + height), (0, 255, 0), 5)  # [P3] width/height were swapped
-
-        # Publish the image with the detection bounding boxes
-        image_detection_message = self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8")
+        # Publish the image (degraded if enabled) with the detection bounding boxes
+        image_detection_message = self.cv_bridge_.cv2_to_imgmsg(
+            self.draw_detections(image, detections, labels),
+            encoding="rgb8")
         self.image_detections_pub_.publish(image_detection_message)
 
         if self.artifact_found_:
@@ -295,6 +295,50 @@ class CaveExplorer(Node):
             depth = depth.astype(np.float32) / (1000.0 if depth_msg.encoding == '16UC1' else 1.0)
             self.localise_artifact(detections, labels, image_msg.header, image.shape, depth)  # [P3] pass detections
 
+
+    def run_detector(self, image):
+        """Run the Faster R-CNN detector once, return boxes (x, y, w, h) and class names"""
+        with torch.no_grad():
+            out = self.computer_vision_model_([TF.to_tensor(image)])[0]
+        detections, labels = [], []
+        for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
+            if score < 0.5:  # CONF from the notebook
+                continue
+            x1, y1, x2, y2 = box.tolist()
+            detections.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+            labels.append(self.class_names_[int(label) - 1])
+        return detections, labels
+
+    def degrade(self, image):
+        """
+        [A1] Simulate a dirty camera lens: blur, dust spots (fixed position, semi-transparent),
+        lower contrast and sensor noise.
+        """
+        h, w = image.shape[:2]
+        if self.dirt_mask_ is None or self.dirt_mask_.shape != (h, w):
+            rng = np.random.default_rng(0)
+            mask = np.zeros((h, w), np.float32)
+            for _ in range(25):
+                cx, cy = int(rng.integers(0, w)), int(rng.integers(0, h))
+                axes = (int(rng.integers(10, 50)), int(rng.integers(10, 50)))
+                cv2.ellipse(mask, (cx, cy), axes, float(rng.integers(0, 180)), 0, 360, 1.0, -1)
+            self.dirt_mask_ = cv2.GaussianBlur(mask, (0, 0), 8)[..., None] * 0.7
+        img = cv2.GaussianBlur(image, (0, 0), 1.5).astype(np.float32)
+        img = 0.8 * img + 0.2 * 128.0                                  # lower contrast
+        dirt = np.array([90.0, 70.0, 50.0], np.float32)                # brownish dust (RGB)
+        img = img * (1.0 - self.dirt_mask_) + dirt * self.dirt_mask_
+        img += np.random.normal(0.0, 6.0, img.shape)                   # sensor noise
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+    def draw_detections(self, image, detections, labels):
+        """Draw boxes and class names on a copy of the image"""
+        vis = image.copy()
+        for (x, y, w, h), label in zip(detections, labels):
+            r, g, b = ARTIFACT_COLOURS.get(label, (1.0, 1.0, 0.0))
+            colour = (int(255 * r), int(255 * g), int(255 * b))   # image is RGB
+            cv2.rectangle(vis, (x, y), (x + w, y + h), colour, 3)
+            cv2.putText(vis, label, (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
+        return vis
 
     def localise_artifact(self, detections, labels, header, image_shape, depth):
         """
