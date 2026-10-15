@@ -564,7 +564,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /goal_pose
+        Value: /goal_pose_vis
       Value: false
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true

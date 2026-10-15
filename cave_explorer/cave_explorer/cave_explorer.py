@@ -148,7 +148,9 @@ class CaveExplorer(Node):
         self.declare_parameter('print_feedback', rclpy.Parameter.Type.BOOL)
 
         # Publisher for the goal pose visualisation
-        self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose', 1)
+        # [P1] Not 'goal_pose': bt_navigator subscribes to that topic (RViz "2D Goal Pose") and sent
+        # every goal a second time, which preempted our own goal -> spurious ABORTED results
+        self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose_vis', 1)
 
         # Subscribe to the map topic to get current bounds
         self.map_grid_ = None   # [P3] latest SLAM map as numpy array (see map_callback)
