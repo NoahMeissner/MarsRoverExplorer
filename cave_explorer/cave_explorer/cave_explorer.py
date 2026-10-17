@@ -9,28 +9,28 @@ from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.transforms import functional as TF
 import cv2  # OpenCV2
-import numpy as np  # [P3]
+import numpy as np
 import rclpy
-import message_filters  # [P3] synchronise RGB + depth image
+import message_filters 
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  # [P3] + PointStamped
+from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo  # [P3] + CameraInfo
-from std_msgs.msg import ColorRGBA  # [P3]
+from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import ColorRGBA
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-from tf2_geometry_msgs import do_transform_point  # [P3]
-from sklearn.cluster import DBSCAN  # [P3] clustering of repeated observations
+from tf2_geometry_msgs import do_transform_point 
+from sklearn.cluster import DBSCAN 
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
 
-# [P3] Marker colour (r, g, b) per artefact class
+# Marker colour (r, g, b) per artefact class
 ARTIFACT_COLOURS = {
     'alien':    (0.0, 1.0, 0.2),
     'ball':     (0.2, 0.4, 1.0),
@@ -40,7 +40,7 @@ ARTIFACT_COLOURS = {
     'stop':     (1.0, 0.0, 0.0),
 }
 
-
+# Helper Class
 def wrap_angle(angle):
     """Function to wrap an angle between 0 and 2*Pi"""
     while angle < 0.0:
@@ -51,6 +51,7 @@ def wrap_angle(angle):
 
     return angle
 
+# Helper Class
 def pose2d_to_pose(pose_2d):
     """Convert a Pose2D to a full 3D Pose"""
     pose = Pose()
@@ -117,15 +118,15 @@ class CaveExplorer(Node):
         # Remember the artifact locations
         # Array of type geometry_msgs.Point
         self.artifact_locations_ = []
-        self.artifact_labels_ = []         # [P3] class name for each entry of artifact_locations_
-        self.artifact_observations_ = {}   # [P3] all observations per class: {label: [np.array([x, y, z]), ...]}
+        self.artifact_labels_ = []         # class name for each entry of artifact_locations_
+        self.artifact_observations_ = {}   # all observations per class: {label: [np.array([x, y, z]), ...]}
 
         # Initialise CvBridge
         self.cv_bridge_ = CvBridge()
 
         # Prepare transformation to get robot pose
         self.tf_buffer = Buffer()
-        # [P3] TF is received by a small helper node in its own thread, so the buffer stays
+        # TF is received by a small helper node in its own thread, so the buffer stays
         # up to date while the detector blocks the image callback (~1 s).
         # (spin_thread=True on the main node would also spin the action client -> crash)
         self.tf_node_ = rclpy.create_node(
@@ -145,7 +146,7 @@ class CaveExplorer(Node):
         self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose', 1)
 
         # Subscribe to the map topic to get current bounds
-        self.map_grid_ = None   # [P3] latest SLAM map as numpy array (see map_callback)
+        self.map_grid_ = None   # latest SLAM map as numpy array (see map_callback)
         self.map_sub_ = self.create_subscription(OccupancyGrid, 'map',  self.map_callback, 1)
 
         # Prepare image processing
@@ -160,12 +161,12 @@ class CaveExplorer(Node):
         model.load_state_dict(torch.load(self.get_parameter('computer_vision_model_filename').value,
                                         map_location='cpu'))
         model.eval()
-        # [P3] PyTorch uses all CPU cores by default and then starves Gazebo, SLAM and the
+        # PyTorch uses all CPU cores by default and then starves Gazebo, SLAM and the
         # odometry (TF lags by seconds) -> limit the detector to 2 threads
         torch.set_num_threads(2)
         self.computer_vision_model_ = model
 
-        # [P3] RGB + depth image are synchronised by timestamp, so the depth always belongs
+        # RGB + depth image are synchronised by timestamp, so the depth always belongs
         # to the RGB image the detection was made in (the detector takes ~1 s on the CPU)
         self.image_sub_ = message_filters.Subscriber(self, Image, 'camera/image', qos_profile=1)
         self.depth_sub_ = message_filters.Subscriber(self, Image, 'camera/depth/image', qos_profile=1)
@@ -173,12 +174,12 @@ class CaveExplorer(Node):
             [self.image_sub_, self.depth_sub_], queue_size=5, slop=0.1)
         self.image_sync_.registerCallback(self.image_callback)
 
-        # [P3] Camera intrinsics for artifact localisation (check names with "ros2 topic list")
+        # Camera intrinsics for artifact localisation (check names with "ros2 topic list")
         self.camera_info_ = None
         self.declare_parameter('camera_hfov', 2.0944)  # 120 deg, <horizontal_fov> in urdf/mars_explorer.gazebo.xacro (used if no CameraInfo arrives)
         self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
 
-        # [A1] Simulated camera degradation (dirty lens). True: every image is degraded
+        # Simulated camera degradation (dirty lens). True: every image is degraded
         # before detection, False: clean images. Set in the launch file: 'degrade': True
         self.declare_parameter('degrade', False)
         self.degrade_ = self.get_parameter('degrade').value
@@ -232,7 +233,7 @@ class CaveExplorer(Node):
         self.xlim_ = [map_origin[0], map_origin[0]+map_width*map_resolution]
         self.ylim_ = [map_origin[1], map_origin[1]+map_height*map_resolution]
 
-        # [P3] keep the map to check artifact estimates against walls / unknown space
+        # keep the map to check artifact estimates against walls / unknown space
         self.map_info_ = map_msg.info
         self.map_grid_ = np.array(map_msg.data, dtype=np.int8).reshape(map_height, map_width)
 
@@ -240,11 +241,11 @@ class CaveExplorer(Node):
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
         # self.get_logger().warn(f'  ylim = [{self.ylim_[0]:.2f}, {self.ylim_[1]:.2f}]')
 
-    # [P3] Store the camera intrinsics
+    # Store the camera intrinsics
     def camera_info_callback(self, info_msg):
         self.camera_info_ = info_msg
 
-    def image_callback(self, image_msg, depth_msg):  # [P3] + depth_msg (synchronised)
+    def image_callback(self, image_msg, depth_msg):  # + depth_msg (synchronised)
         """
         Recieve an RGB image.
         Use this method to detect artifacts of interest.
@@ -260,7 +261,7 @@ class CaveExplorer(Node):
         # Create a grayscale version (some simple models use this)
         # image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # [A1] Optionally degrade the image (dirty lens), then run the detector ONCE
+        # Optionally degrade the image (dirty lens), then run the detector ONCE
         t0 = time.time()
         if self.degrade_:
             image = self.degrade(image)
@@ -290,12 +291,12 @@ class CaveExplorer(Node):
 
         if self.artifact_found_:
             self.get_logger().info('Artifact found!')
-            # [P3] depth image in metres, taken at the same time as the RGB image
+            # depth image in metres, taken at the same time as the RGB image
             depth = self.cv_bridge_.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
             depth = depth.astype(np.float32) / (1000.0 if depth_msg.encoding == '16UC1' else 1.0)
-            self.localise_artifact(detections, labels, image_msg.header, image.shape, depth)  # [P3] pass detections
+            self.localise_artifact(detections, labels, image_msg.header, image.shape, depth)  # pass detections
 
-
+    # Run Classification Model
     def run_detector(self, image):
         """Run the Faster R-CNN detector once, return boxes (x, y, w, h) and class names"""
         with torch.no_grad():
@@ -309,9 +310,10 @@ class CaveExplorer(Node):
             labels.append(self.class_names_[int(label) - 1])
         return detections, labels
 
+    # Simulation of the dirty camers
     def degrade(self, image):
         """
-        [A1] Simulate a dirty camera lens: blur, dust spots (fixed position, semi-transparent),
+        Simulate a dirty camera lens: blur, dust spots (fixed position, semi-transparent),
         lower contrast and sensor noise.
         """
         h, w = image.shape[:2]
@@ -342,7 +344,7 @@ class CaveExplorer(Node):
 
     def localise_artifact(self, detections, labels, header, image_shape, depth):
         """
-        [P3] Compute the location of each detected artifact:
+        Compute the location of each detected artifact:
           - direction from the pixel coordinates of the bounding box centre (pinhole model)
           - distance from the depth camera (25 % quantile of the depth in the centre of the box)
           - transform into the map frame with TF (robot pose at the time the image was taken)
@@ -455,7 +457,7 @@ class CaveExplorer(Node):
         self.publish_artifact_markers()
 
     def camera_point(self, frame, right, down, forward):
-        """[P3] Point in the camera frame (optical or ROS body convention)"""
+        """Point in the camera frame (optical or ROS body convention)"""
         p = PointStamped()
         p.header.frame_id = frame
         if 'optical' in frame:   # optical frame: z forward, x right, y down
@@ -466,7 +468,7 @@ class CaveExplorer(Node):
 
     def check_against_map(self, cam, pos):
         """
-        [P3] Walk along the viewing ray from the camera to the estimate through the SLAM map.
+        Walk along the viewing ray from the camera to the estimate through the SLAM map.
           - ray hits a wall first -> the depth was too long (e.g. looked past the object),
             the estimate is moved onto the wall (slightly in front of it)
           - estimate lies in unknown space or outside the map -> rejected (None)
@@ -498,21 +500,21 @@ class CaveExplorer(Node):
 
         # Update the locations
         self.marker_artifacts_.points = self.artifact_locations_
-        # [P3] one colour per class
+        # one colour per class
         self.marker_artifacts_.colors = [ColorRGBA(r=c[0], g=c[1], b=c[2], a=1.0)
                                          for c in (ARTIFACT_COLOURS.get(l, (1.0, 1.0, 0.0))
                                                    for l in self.artifact_labels_)]
 
         # Create and publish the MarkerArray
         marker_array = MarkerArray()
-        # [P3] remove old text labels first (number of clusters can shrink when clusters merge)
+        # remove old text labels first (number of clusters can shrink when clusters merge)
         clear = Marker()
         clear.header.frame_id = "map"
         clear.ns = "artifact_labels"
         clear.action = Marker.DELETEALL
         marker_array.markers = [clear, self.marker_artifacts_]
 
-        # [P3] text label above each artifact
+        # text label above each artifact
         for i, (point, label) in enumerate(zip(self.artifact_locations_, self.artifact_labels_)):
             text = Marker()
             text.header.frame_id = "map"

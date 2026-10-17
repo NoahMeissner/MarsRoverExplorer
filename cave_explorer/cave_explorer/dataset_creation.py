@@ -11,9 +11,9 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 RGB_TOPIC = '/camera/image'
 DEPTH_TOPIC = '/camera/depth/image'
 BASE_DIR = os.path.expanduser('~/cave_dataset')
-SAVE_INTERVAL = 1.0   # Sekunden zwischen Bildern
-MIN_DIFF = 12.0       # wie stark sich das RGB-Bild ändern muss
-MAX_DEPTH = 10.0      # Meter, nur für die Vorschau-Bilder
+SAVE_INTERVAL = 1.0   # Seconds between images
+MIN_DIFF = 12.0       # how the rgb needs to change to the last one
+MAX_DEPTH = 10.0     
 
 
 class DatasetSaver(Node):
@@ -34,7 +34,7 @@ class DatasetSaver(Node):
         self.sync = ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub], queue_size=10, slop=0.1)
         self.sync.registerCallback(self.callback)
-        self.get_logger().info(f'Speichere RGB + Tiefe nach {BASE_DIR}')
+        self.get_logger().info(f'Save RGB + Depth to {BASE_DIR}')
 
     def callback(self, rgb_msg, depth_msg):
         now = time.time()
@@ -43,13 +43,13 @@ class DatasetSaver(Node):
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
 
-        # Fast gleiche Bilder überspringen
+        # Same image skip
         small = cv2.resize(rgb, (64, 48)).astype(np.float32)
         if self.last_small is not None and \
                 np.mean(np.abs(small - self.last_small)) < MIN_DIFF:
             return
 
-        # Tiefe in Meter (float) umwandeln
+        # Change Depth in meter (float)
         depth = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
         if depth_msg.encoding == '16UC1':
             depth_m = depth.astype(np.float32) / 1000.0
@@ -60,15 +60,15 @@ class DatasetSaver(Node):
         name = f'img_{self.count:05d}'
         # 1) RGB
         cv2.imwrite(os.path.join(self.dirs['rgb'], name + '.png'), rgb)
-        # 2) Tiefe exakt als 16-bit PNG in Millimetern
+        # 2) exact depth as 16-bit PNG in milimeter
         depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
         cv2.imwrite(os.path.join(self.dirs['depth'], name + '.png'), depth_mm)
-        # 3) Vorschau zum Anschauen (nicht zum Trainieren)
+        # 3) Overview, not for training
         vis = np.clip(depth_m / MAX_DEPTH * 255, 0, 255).astype(np.uint8)
         vis = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
         cv2.imwrite(os.path.join(self.dirs['depth_vis'], name + '.png'), vis)
 
-        self.get_logger().info(f'Gespeichert: {name}')
+        self.get_logger().info(f'Saved: {name}')
         self.count += 1
         self.last_time = now
         self.last_small = small

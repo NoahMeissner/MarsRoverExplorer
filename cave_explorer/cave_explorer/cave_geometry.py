@@ -18,7 +18,6 @@ Separate ROS node that analyses the SLAM map online:
 
 import math
 import os
-
 import cv2
 import numpy as np
 import rclpy
@@ -31,10 +30,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
-
-# ----------------------------------------------------------------------------
-# Pure analysis (no ROS) -> can be tested offline
-# ----------------------------------------------------------------------------
+# Helper Class
 def non_max_suppression(candidates, min_dist_px, smallest_first):
     """candidates: list of (value, row, col). Keep the best one, drop others closer than min_dist_px."""
     candidates = sorted(candidates, key=lambda c: c[0], reverse=not smallest_first)
@@ -80,7 +76,7 @@ def analyse_map(grid, res, robot_rc=None,
                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                            (2 * int(robot_r_px) + 1,) * 2)).astype(bool) & (free_u8 > 0)
 
-    # ---- Gradient (Jacobian) and Hessian of the smoothed distance transform ----
+    # Gradient (Jacobian) and Hessian of the smoothed distance transform
     D = cv2.GaussianBlur(dt_free, (0, 0), 1.0)
     gy, gx = np.gradient(D)                 # rows = y, cols = x
     grad_mag = np.hypot(gx, gy)
@@ -97,12 +93,12 @@ def analyse_map(grid, res, robot_rc=None,
 
     nms_px = nms_dist / res
 
-    # ---- Widest accessible area: global maximum of D (largest inscribed circle) ----
+    # Widest accessible area: global maximum of D (largest inscribed circle)
     d_acc = np.where(accessible, dt_free, 0)
     r, c = np.unravel_index(np.argmax(d_acc), d_acc.shape)
     result['widest'] = {'rc': (r, c), 'width': 2 * dt_free[r, c] * res}
 
-    # ---- Other wide areas: local maxima of D ----
+    # Other wide areas: local maxima of D
     k = max(3, int(nms_px) | 1)
     local_max = (d_acc >= cv2.dilate(d_acc, np.ones((k, k), np.uint8))) & accessible
     cand = sorted(((dt_free[r, c], r, c) for r, c in zip(*np.nonzero(local_max))
@@ -114,7 +110,7 @@ def analyse_map(grid, res, robot_rc=None,
             wide.append((v, r, c))
     result['wide'] = [{'rc': (r, c), 'width': 2 * v * res} for v, r, c in wide[:max_features]]
 
-    # ---- Narrow passages: minima of D along the ridge (saddle points) ----
+    # Narrow passages: minima of D along the ridge (saddle points)
     # Each connected piece of ridge that is narrower than narrow_max_width is one passage.
     # Its narrowest point (middle of the narrowest stretch) is reported.
     narrow_ridge = ridge & (2 * dt_free * res <= narrow_max_width) & (dt_wall <= dt_free + 2)
