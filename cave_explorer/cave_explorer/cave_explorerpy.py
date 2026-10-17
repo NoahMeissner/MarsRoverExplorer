@@ -9,9 +9,9 @@ from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.transforms import functional as TF
 import cv2  # OpenCV2
-import numpy as np 
+import numpy as np  
 import rclpy
-import message_filters 
+import message_filters  
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  
 from nav2_msgs.action import NavigateToPose
