@@ -9,22 +9,22 @@ from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.transforms import functional as TF
 import cv2  # OpenCV2
-import numpy as np  # [P3]
+import numpy as np 
 import rclpy
-import message_filters  # [P3] synchronise RGB + depth image
+import message_filters 
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  # [P3] + PointStamped
+from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo  # [P3] + CameraInfo
-from std_msgs.msg import ColorRGBA  # [P3]
+from sensor_msgs.msg import Image, CameraInfo  
+from std_msgs.msg import ColorRGBA 
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-from tf2_geometry_msgs import do_transform_point  # [P3]
-from sklearn.cluster import DBSCAN  # [P3] clustering of repeated observations
+from tf2_geometry_msgs import do_transform_point 
+from sklearn.cluster import DBSCAN  
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
@@ -178,12 +178,26 @@ class CaveExplorer(Node):
         self.declare_parameter('camera_hfov', 2.0944)  # 120 deg, <horizontal_fov> in urdf/mars_explorer.gazebo.xacro (used if no CameraInfo arrives)
         self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
 
-        # [A1] Simulated camera degradation (dirty lens). True: every image is degraded
-        # before detection, False: clean images. Set in the launch file: 'degrade': True
+        # [A1] Simulated camera degradation that gets WORSE OVER TIME. Set in the launch file:
+        #   'degrade': True/False          -> degrade the images or not
+        #   'degrade_type': 'dirt' | 'dark' | 'both'
+        #        dirt: dust spots collect on the lens, dark: the light fades
+        #   'degrade_ramp_time': seconds (sim time) until the maximum severity is reached
         self.declare_parameter('degrade', False)
+        self.declare_parameter('degrade_type', 'both')
+        self.declare_parameter('degrade_ramp_time', 300.0)
         self.degrade_ = self.get_parameter('degrade').value
-        self.dirt_mask_ = None   # created once for the image size (same dirt on every frame)
-        self.get_logger().info(f'[A1] degrade = {self.degrade_}')
+        self.degrade_type_ = self.get_parameter('degrade_type').value
+        self.degrade_ramp_time_ = float(self.get_parameter('degrade_ramp_time').value)
+        self.degrade_start_ = None      # time of the first image
+        self.dirt_spots_ = None         # random spot parameters (same spots, they only accumulate)
+        self.dirt_mask_ = None
+        self.dirt_mask_count_ = -1      # number of spots currently drawn into dirt_mask_
+        # degraded camera stream (without boxes) for RViz, next to the original camera/image
+        self.degraded_image_pub_ = self.create_publisher(Image, 'degraded_image', 1)
+        self.get_logger().info(f'[A1] degrade = {self.degrade_}, type = {self.degrade_type_}, '
+                               f'ramp time = {self.degrade_ramp_time_:.0f} s, model = '
+                               f'{self.get_parameter("computer_vision_model_filename").value}')
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
@@ -260,14 +274,22 @@ class CaveExplorer(Node):
         # Create a grayscale version (some simple models use this)
         # image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # [A1] Optionally degrade the image (dirty lens), then run the detector ONCE
+        # [A1] Optionally degrade the image, then run the detector ONCE
         t0 = time.time()
+        severity = 0.0
         if self.degrade_:
-            image = self.degrade(image)
+            # severity grows linearly from 0 to 1 over degrade_ramp_time (sim time)
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if self.degrade_start_ is None:
+                self.degrade_start_ = now
+            severity = min(1.0, (now - self.degrade_start_) / max(self.degrade_ramp_time_, 1e-3))
+            image = self.degrade(image, self.degrade_type_, severity)
+            self.degraded_image_pub_.publish(self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8"))
         t1 = time.time()
         detections, labels = self.run_detector(image)
         t2 = time.time()
-        self.get_logger().info(f'[A1] timing: degrade {1000 * (t1 - t0):.0f} ms | detector {1000 * (t2 - t1):.0f} ms',
+        self.get_logger().info(f'[A1] severity {severity:.2f} | {len(detections)} detections | '
+                               f'degrade {1000 * (t1 - t0):.0f} ms | detector {1000 * (t2 - t1):.0f} ms',
                                throttle_duration_sec=10.0)
 
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
@@ -309,25 +331,36 @@ class CaveExplorer(Node):
             labels.append(self.class_names_[int(label) - 1])
         return detections, labels
 
-    def degrade(self, image):
+    def degrade(self, image, kind='both', severity=0.5):
         """
-        [A1] Simulate a dirty camera lens: blur, dust spots (fixed position, semi-transparent),
-        lower contrast and sensor noise.
+        [A1] Simulated camera degradations, severity 0 (clean) .. 1 (worst), grows over time:
+          dirt : dust spots collect on the lens (0 -> 45 spots, more opaque over time)
+          dark : the light fades (darker image, stronger sensor noise)
+          both : dirt + dark
         """
-        h, w = image.shape[:2]
-        if self.dirt_mask_ is None or self.dirt_mask_.shape != (h, w):
-            rng = np.random.default_rng(0)
-            mask = np.zeros((h, w), np.float32)
-            for _ in range(25):
-                cx, cy = int(rng.integers(0, w)), int(rng.integers(0, h))
-                axes = (int(rng.integers(10, 50)), int(rng.integers(10, 50)))
-                cv2.ellipse(mask, (cx, cy), axes, float(rng.integers(0, 180)), 0, 360, 1.0, -1)
-            self.dirt_mask_ = cv2.GaussianBlur(mask, (0, 0), 8)[..., None] * 0.7
-        img = cv2.GaussianBlur(image, (0, 0), 1.5).astype(np.float32)
-        img = 0.8 * img + 0.2 * 128.0                                  # lower contrast
-        dirt = np.array([90.0, 70.0, 50.0], np.float32)                # brownish dust (RGB)
-        img = img * (1.0 - self.dirt_mask_) + dirt * self.dirt_mask_
-        img += np.random.normal(0.0, 6.0, img.shape)                   # sensor noise
+        img = image.astype(np.float32)
+
+        if kind in ('dirt', 'both'):
+            h, w = image.shape[:2]
+            if self.dirt_spots_ is None:
+                rng = np.random.default_rng(0)
+                self.dirt_spots_ = [((int(rng.integers(0, w)), int(rng.integers(0, h))),
+                                     (int(rng.integers(10, 50)), int(rng.integers(10, 50))),
+                                     float(rng.integers(0, 180))) for _ in range(45)]
+            n = int(round(45 * severity))                              # spots appear one by one
+            if n != self.dirt_mask_count_:
+                mask = np.zeros((h, w), np.float32)
+                for centre, axes, ang in self.dirt_spots_[:n]:
+                    cv2.ellipse(mask, centre, axes, ang, 0, 360, 1.0, -1)
+                self.dirt_mask_ = cv2.GaussianBlur(mask, (0, 0), 8)[..., None]
+                self.dirt_mask_count_ = n
+            alpha = self.dirt_mask_ * (0.4 + 0.5 * severity)           # spots get more opaque
+            img = img * (1.0 - alpha) + np.array([90.0, 70.0, 50.0], np.float32) * alpha
+
+        if kind in ('dark', 'both'):
+            img = 255.0 * (np.clip(img, 0, 255) / 255.0) ** (1.0 + 1.5 * severity)   # darker shadows
+            img *= (1.0 - 0.6 * severity)                              # brightness 100 % -> 40 %
+            img += np.random.normal(0.0, 12.0 * severity, img.shape)  # more sensor noise
         return np.clip(img, 0, 255).astype(np.uint8)
 
     def draw_detections(self, image, detections, labels):
