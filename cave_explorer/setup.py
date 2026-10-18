@@ -35,7 +35,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'cave_explorer = cave_explorer.cave_explorer:main'
+            'cave_explorer = cave_explorer.cave_explorer:main',
+            'cave_geometry = cave_explorer.cave_geometry:main',
         ],
     },
 )

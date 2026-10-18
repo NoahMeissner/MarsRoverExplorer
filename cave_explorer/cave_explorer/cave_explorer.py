@@ -11,9 +11,9 @@ from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.transforms import functional as TF
 import cv2  # OpenCV2
-import numpy as np  # [P3]
+import numpy as np
 import rclpy
-import message_filters  # [P3] synchronise RGB + depth image
+import message_filters 
 from cv_bridge import CvBridge
 from action_msgs.msg import GoalStatus  # [P1]
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped  # [P3] + PointStamped
@@ -22,6 +22,7 @@ from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor
 from sensor_msgs.msg import Image, CameraInfo  # [P3] + CameraInfo
 from sensor_msgs.msg import PointCloud2  # [P1]
 from sensor_msgs_py import point_cloud2  # [P1]
@@ -30,17 +31,18 @@ from std_msgs.msg import ColorRGBA  # [P3]
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-from tf2_geometry_msgs import do_transform_point  # [P3]
-from sklearn.cluster import DBSCAN  # [P3] clustering of repeated observations
+from tf2_geometry_msgs import do_transform_point 
+from sklearn.cluster import DBSCAN 
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
 from cave_explorer.frontier_exploration import FrontierExplorer, OCCUPIED_THRESHOLD, wrap_pi  # [P1]
 from cave_explorer.inspection import choose_viewpoint, line_of_sight  # [P2]
+from cave_explorer.degradation import degrade, dust_alpha, dust_spots
 
 
-# [P3] Marker colour (r, g, b) per artefact class
+# Marker colour (r, g, b) per artefact class
 ARTIFACT_COLOURS = {
     'alien':    (0.0, 1.0, 0.2),
     'ball':     (0.2, 0.4, 1.0),
@@ -68,6 +70,7 @@ def wrap_angle(angle):
 
     return angle
 
+# Helper Class
 def pose2d_to_pose(pose_2d):
     """Convert a Pose2D to a full 3D Pose"""
     pose = Pose()
@@ -138,15 +141,15 @@ class CaveExplorer(Node):
         # Remember the artifact locations
         # Array of type geometry_msgs.Point
         self.artifact_locations_ = []
-        self.artifact_labels_ = []         # [P3] class name for each entry of artifact_locations_
-        self.artifact_observations_ = {}   # [P3] all observations per class: {label: [np.array([x, y, z]), ...]}
+        self.artifact_labels_ = []         # class name for each entry of artifact_locations_
+        self.artifact_observations_ = {}   # all observations per class: {label: [np.array([x, y, z]), ...]}
 
         # Initialise CvBridge
         self.cv_bridge_ = CvBridge()
 
         # Prepare transformation to get robot pose
         self.tf_buffer = Buffer()
-        # [P3] TF is received by a small helper node in its own thread, so the buffer stays
+        # TF is received by a small helper node in its own thread, so the buffer stays
         # up to date while the detector blocks the image callback (~1 s).
         # (spin_thread=True on the main node would also spin the action client -> crash)
         self.tf_node_ = rclpy.create_node(
@@ -168,7 +171,7 @@ class CaveExplorer(Node):
         self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose_vis', 1)
 
         # Subscribe to the map topic to get current bounds
-        self.map_grid_ = None   # [P3] latest SLAM map as numpy array (see map_callback)
+        self.map_grid_ = None   # latest SLAM map as numpy array (see map_callback)
         self.map_sub_ = self.create_subscription(OccupancyGrid, 'map',  self.map_callback, 1)
 
         # Prepare image processing
@@ -183,12 +186,12 @@ class CaveExplorer(Node):
         model.load_state_dict(torch.load(self.get_parameter('computer_vision_model_filename').value,
                                         map_location='cpu'))
         model.eval()
-        # [P3] PyTorch uses all CPU cores by default and then starves Gazebo, SLAM and the
+        # PyTorch uses all CPU cores by default and then starves Gazebo, SLAM and the
         # odometry (TF lags by seconds) -> limit the detector to 2 threads
         torch.set_num_threads(2)
         self.computer_vision_model_ = model
 
-        # [P3] RGB + depth image are synchronised by timestamp, so the depth always belongs
+        # RGB + depth image are synchronised by timestamp, so the depth always belongs
         # to the RGB image the detection was made in (the detector takes ~1 s on the CPU)
         self.image_sub_ = message_filters.Subscriber(self, Image, 'camera/image', qos_profile=1)
         self.depth_sub_ = message_filters.Subscriber(self, Image, 'camera/depth/image', qos_profile=1)
@@ -196,7 +199,7 @@ class CaveExplorer(Node):
             [self.image_sub_, self.depth_sub_], queue_size=5, slop=0.1)
         self.image_sync_.registerCallback(self.image_callback)
 
-        # [P3] Camera intrinsics for artifact localisation (check names with "ros2 topic list")
+        # Camera intrinsics for artifact localisation (check names with "ros2 topic list")
         self.camera_info_ = None
         self.declare_parameter('camera_hfov', 2.0944)  # 120 deg, <horizontal_fov> in urdf/mars_explorer.gazebo.xacro (used if no CameraInfo arrives)
         self.camera_info_sub_ = self.create_subscription(CameraInfo, 'camera/camera_info', self.camera_info_callback, 1)
@@ -286,6 +289,22 @@ class CaveExplorer(Node):
         self.last_inspect_try_ = -math.inf
         self.inspection_log_ = None
 
+        any_type = ParameterDescriptor(dynamic_typing=True)
+        self.degrade_ = self.declare_parameter('degrade', False).value
+        self.degrade_type_ = self.declare_parameter('degrade_type', 'both').value
+        self.degrade_severity_ = float(self.declare_parameter('degrade_severity', 1.0, any_type).value)
+        self.degrade_ramp_time_ = float(self.declare_parameter('degrade_ramp_time', 300.0, any_type).value)
+        self.degrade_start_ = None
+        self.dust_spots_ = None
+        self.dust_alpha_ = None
+        self.dust_alpha_count_ = -1
+        self.perception_log_ = None
+        self.degraded_image_pub_ = self.create_publisher(Image, 'degraded_image', 1)
+        self.get_logger().info(
+            f'[A1] model {os.path.basename(self.get_parameter("computer_vision_model_filename").value)} | '
+            f'degrade {self.degrade_} ({self.degrade_type_}, severity {self.degrade_severity_}, '
+            f'ramp {self.degrade_ramp_time_:.0f} s)')
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
 
@@ -331,7 +350,7 @@ class CaveExplorer(Node):
         self.xlim_ = [map_origin[0], map_origin[0]+map_width*map_resolution]
         self.ylim_ = [map_origin[1], map_origin[1]+map_height*map_resolution]
 
-        # [P3] keep the map to check artifact estimates against walls / unknown space
+        # keep the map to check artifact estimates against walls / unknown space
         self.map_info_ = map_msg.info
         self.map_grid_ = np.array(map_msg.data, dtype=np.int8).reshape(map_height, map_width)
 
@@ -339,11 +358,11 @@ class CaveExplorer(Node):
         # self.get_logger().warn(f'  xlim = [{self.xlim_[0]:.2f}, {self.xlim_[1]:.2f}]')
         # self.get_logger().warn(f'  ylim = [{self.ylim_[0]:.2f}, {self.ylim_[1]:.2f}]')
 
-    # [P3] Store the camera intrinsics
+    # Store the camera intrinsics
     def camera_info_callback(self, info_msg):
         self.camera_info_ = info_msg
 
-    def image_callback(self, image_msg, depth_msg):  # [P3] + depth_msg (synchronised)
+    def image_callback(self, image_msg, depth_msg):  # + depth_msg (synchronised)
         """
         Recieve an RGB image.
         Use this method to detect artifacts of interest.
@@ -359,21 +378,19 @@ class CaveExplorer(Node):
         # Create a grayscale version (some simple models use this)
         # image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # Retrieve the pre-trained model
-        stop_sign_model = self.computer_vision_model_
-
-        # Detect artifacts in the image
-        # The minSize is used to avoid very small detections that are probably noise
-        with torch.no_grad():
-            out = stop_sign_model([TF.to_tensor(image)])[0]
-        detections = []
-        labels = []
-        for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
-            if score < 0.5:  # CONF from the notebook
-                continue
-            x1, y1, x2, y2 = box.tolist()
-            detections.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
-            labels.append(self.class_names_[int(label) - 1])
+        t0 = time.time()
+        severity = 0.0
+        if self.degrade_:
+            severity = self.current_severity()
+            image = self.degrade_image(image, severity)
+            self.degraded_image_pub_.publish(self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8"))
+        t1 = time.time()
+        detections, labels = self.run_detector(image)
+        t2 = time.time()
+        self.get_logger().info(f'[A1] severity {severity:.2f} | {len(detections)} detections | '
+                               f'degrade {1000 * (t1 - t0):.0f} ms | detector {1000 * (t2 - t1):.0f} ms',
+                               throttle_duration_sec=10.0)
+        self.log_perception(severity, labels)
 
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
         # You may want to communicate more information
@@ -387,31 +404,83 @@ class CaveExplorer(Node):
         else:
             self.artifact_found_ = False
 
-        # Draw a bounding box rectangle on the image for each detection
-        for(x, y, width, height) in detections:
-            cv2.rectangle(image, (x, y), (x + width, y + height), (0, 255, 0), 5)  # [P3] width/height were swapped
-
-        # Publish the image with the detection bounding boxes
-        image_detection_message = self.cv_bridge_.cv2_to_imgmsg(image, encoding="rgb8")
-        self.image_detections_pub_.publish(image_detection_message)
+        annotated = self.draw_detections(image, detections, labels)
+        self.image_detections_pub_.publish(self.cv_bridge_.cv2_to_imgmsg(annotated, encoding="rgb8"))
 
         # [P2] When was each class last seen in the camera, and the latest annotated image
         now = self.now_s()
         for label in labels:
             self.last_seen_[label] = now
-        self.last_annotated_image_ = image
+        self.last_annotated_image_ = annotated
 
         if self.artifact_found_:
             self.get_logger().info('Artifact found!')
-            # [P3] depth image in metres, taken at the same time as the RGB image
+            # depth image in metres, taken at the same time as the RGB image
             depth = self.cv_bridge_.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
             depth = depth.astype(np.float32) / (1000.0 if depth_msg.encoding == '16UC1' else 1.0)
-            self.localise_artifact(detections, labels, image_msg.header, image.shape, depth)  # [P3] pass detections
+            self.localise_artifact(detections, labels, image_msg.header, image.shape, depth)  # pass detections
 
+    # Run Classification Model
+    def run_detector(self, image):
+        """Run the Faster R-CNN detector once, return boxes (x, y, w, h) and class names"""
+        with torch.no_grad():
+            out = self.computer_vision_model_([TF.to_tensor(image)])[0]
+        detections, labels = [], []
+        for box, label, score in zip(out['boxes'], out['labels'], out['scores']):
+            if score < 0.5:  # CONF from the notebook
+                continue
+            x1, y1, x2, y2 = box.tolist()
+            detections.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+            labels.append(self.class_names_[int(label) - 1])
+        return detections, labels
+
+    def current_severity(self):
+        now = self.now_s()
+        if self.degrade_start_ is None:
+            self.degrade_start_ = now
+        if self.degrade_ramp_time_ <= 0:
+            return self.degrade_severity_
+        return self.degrade_severity_ * min(1.0, (now - self.degrade_start_) / self.degrade_ramp_time_)
+
+    def degrade_image(self, image, severity):
+        if self.degrade_type_ in ('dust', 'both'):
+            if self.dust_spots_ is None:
+                self.dust_spots_ = dust_spots(image.shape)
+            n = int(round(severity * len(self.dust_spots_)))
+            if n != self.dust_alpha_count_:
+                self.dust_alpha_ = dust_alpha(image.shape, self.dust_spots_[:n])
+                self.dust_alpha_count_ = n
+        return degrade(image, self.degrade_type_, severity, seed=None, dust_alpha_mask=self.dust_alpha_)
+
+    def log_perception(self, severity, labels):
+        try:
+            if self.perception_log_ is None:
+                os.makedirs(self.log_dir_, exist_ok=True)
+                path = os.path.join(self.log_dir_, time.strftime('perception_%Y%m%d_%H%M%S.csv'))
+                self.perception_log_ = open(path, 'w')
+                self.perception_log_.write('time_s,model,degrade_type,severity,n_detections,labels\n')
+                self.get_logger().info(f'Logging detections to {path}')
+            model = os.path.basename(self.get_parameter('computer_vision_model_filename').value)
+            kind = self.degrade_type_ if self.degrade_ else 'none'
+            self.perception_log_.write(f'{self.now_s():.1f},{model},{kind},{severity:.2f},'
+                                       f'{len(labels)},{" ".join(labels)}\n')
+            self.perception_log_.flush()
+        except OSError as ex:
+            self.get_logger().warn(f'Cannot write perception log: {ex}', once=True)
+
+    def draw_detections(self, image, detections, labels):
+        """Draw boxes and class names on a copy of the image"""
+        vis = image.copy()
+        for (x, y, w, h), label in zip(detections, labels):
+            r, g, b = ARTIFACT_COLOURS.get(label, (1.0, 1.0, 0.0))
+            colour = (int(255 * r), int(255 * g), int(255 * b))   # image is RGB
+            cv2.rectangle(vis, (x, y), (x + w, y + h), colour, 3)
+            cv2.putText(vis, label, (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
+        return vis
 
     def localise_artifact(self, detections, labels, header, image_shape, depth):
         """
-        [P3] Compute the location of each detected artifact:
+        Compute the location of each detected artifact:
           - direction from the pixel coordinates of the bounding box centre (pinhole model)
           - distance from the depth camera (25 % quantile of the depth in the centre of the box)
           - transform into the map frame with TF (robot pose at the time the image was taken)
@@ -524,7 +593,7 @@ class CaveExplorer(Node):
         self.publish_artifact_markers()
 
     def camera_point(self, frame, right, down, forward):
-        """[P3] Point in the camera frame (optical or ROS body convention)"""
+        """Point in the camera frame (optical or ROS body convention)"""
         p = PointStamped()
         p.header.frame_id = frame
         if 'optical' in frame:   # optical frame: z forward, x right, y down
@@ -535,7 +604,7 @@ class CaveExplorer(Node):
 
     def check_against_map(self, cam, pos):
         """
-        [P3] Walk along the viewing ray from the camera to the estimate through the SLAM map.
+        Walk along the viewing ray from the camera to the estimate through the SLAM map.
           - ray hits a wall first -> the depth was too long (e.g. looked past the object),
             the estimate is moved onto the wall (slightly in front of it)
           - estimate lies in unknown space or outside the map -> rejected (None)
@@ -567,14 +636,14 @@ class CaveExplorer(Node):
 
         # Update the locations
         self.marker_artifacts_.points = self.artifact_locations_
-        # [P3] one colour per class
+        # one colour per class
         self.marker_artifacts_.colors = [ColorRGBA(r=c[0], g=c[1], b=c[2], a=1.0)
                                          for c in (ARTIFACT_COLOURS.get(l, (1.0, 1.0, 0.0))
                                                    for l in self.artifact_labels_)]
 
         # Create and publish the MarkerArray
         marker_array = MarkerArray()
-        # [P3] remove old text labels first (number of clusters can shrink when clusters merge)
+        # remove old text labels first (number of clusters can shrink when clusters merge)
         clear = Marker()
         clear.header.frame_id = "map"
         clear.ns = "artifact_labels"
@@ -585,7 +654,7 @@ class CaveExplorer(Node):
         clear_status.action = Marker.DELETEALL
         marker_array.markers = [clear, clear_status, self.marker_artifacts_]
 
-        # [P3] text label above each artifact
+        # text label above each artifact
         for i, (point, label) in enumerate(zip(self.artifact_locations_, self.artifact_labels_)):
             text = Marker()
             text.header.frame_id = "map"
