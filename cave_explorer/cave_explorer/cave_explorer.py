@@ -39,7 +39,7 @@ from visualization_msgs.msg import MarkerArray
 
 from cave_explorer.frontier_exploration import FrontierExplorer, OCCUPIED_THRESHOLD, wrap_pi  # [P1]
 from cave_explorer.inspection import choose_viewpoint, line_of_sight  # [P2]
-from cave_explorer.degradation import degrade, dust_alpha, dust_spots
+from cave_explorer.degradation import KINDS, degrade, dust_alpha, dust_spots
 
 
 # Marker colour (r, g, b) per artefact class
@@ -300,6 +300,8 @@ class CaveExplorer(Node):
         self.dust_alpha_count_ = -1
         self.perception_log_ = None
         self.degraded_image_pub_ = self.create_publisher(Image, 'degraded_image', 1)
+        if self.degrade_ and self.degrade_type_ not in KINDS:
+            self.get_logger().error(f'[A1] unknown degrade_type "{self.degrade_type_}", use one of {KINDS}')
         self.get_logger().info(
             f'[A1] model {os.path.basename(self.get_parameter("computer_vision_model_filename").value)} | '
             f'degrade {self.degrade_} ({self.degrade_type_}, severity {self.degrade_severity_}, '
@@ -443,7 +445,7 @@ class CaveExplorer(Node):
         return self.degrade_severity_ * min(1.0, (now - self.degrade_start_) / self.degrade_ramp_time_)
 
     def degrade_image(self, image, severity):
-        if self.degrade_type_ in ('dust', 'both'):
+        if self.degrade_type_ in ('dust', 'dirt', 'both'):
             if self.dust_spots_ is None:
                 self.dust_spots_ = dust_spots(image.shape)
             n = int(round(severity * len(self.dust_spots_)))

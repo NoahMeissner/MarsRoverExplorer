@@ -32,7 +32,7 @@ def generate_launch_description():
         DeclareLaunchArgument('degrade', default_value='False',
                               description='Degrade the camera images before detection'),
         DeclareLaunchArgument('degrade_type', default_value='both',
-                              description='dust, dark or both'),
+                              description='dust (or dirt), dark or both'),
         DeclareLaunchArgument('degrade_severity', default_value='1.0',
                               description='Maximum severity 0..1'),
         DeclareLaunchArgument('degrade_ramp_time', default_value='300.0',

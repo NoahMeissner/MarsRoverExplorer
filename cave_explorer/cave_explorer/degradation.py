@@ -3,7 +3,7 @@ import numpy as np
 
 DUST_COLOUR = np.array([200.0, 160.0, 120.0], np.float32)
 MAX_DUST_SPOTS = 600
-KINDS = ('dust', 'dark', 'both')
+KINDS = ('dust', 'dirt', 'dark', 'both')
 
 
 def dust_spots(shape, seed=0, n=MAX_DUST_SPOTS):
@@ -71,7 +71,7 @@ def add_darkness(img, severity, seed=None):
 
 def degrade(img, kind, severity, seed=0, dust_alpha_mask=None):
     out = img
-    if kind in ('dust', 'both'):
+    if kind in ('dust', 'dirt', 'both'):
         out = add_dust(out, severity, seed, dust_alpha_mask)
     if kind in ('dark', 'both'):
         out = add_darkness(out, severity, seed)
