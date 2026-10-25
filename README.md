@@ -7,8 +7,6 @@ The robot maps the cave with frontier-based exploration, detects and localises a
 
 ▶️ **[Watch the demo video](https://drive.google.com/file/d/1DZUfOD2u6j2-tVyr4uhz-rBHjEbr6-rS/view?usp=sharing)**
 
-<!-- TODO: add a screenshot, e.g. docs/rviz_overview.png, and link it to the video:
-[![Demo](docs/rviz_overview.png)](https://drive.google.com/file/d/1DZUfOD2u6j2-tVyr4uhz-rBHjEbr6-rS/view?usp=sharing) -->
 
 ---
 
@@ -199,6 +197,3 @@ Camera-coverage frontiers, information-gain term, persistent artefact tracking (
 | Dorian Veloso | Frontier exploration, close-range inspection |
 | Julien Labie | Behaviour switching, cave geometry analysis, videos |
 
-## License
-
-TODO
